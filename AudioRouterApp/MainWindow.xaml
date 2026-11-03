@@ -1,0 +1,31 @@
+<Window x:Class="AudioRouterApp.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Audio Router" Width="400" SizeToContent="Height"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ResizeMode="NoResize" ShowInTaskbar="False" Topmost="True"
+        UseLayoutRounding="True" SnapsToDevicePixels="True"
+        TextOptions.TextFormattingMode="Display"
+        TextOptions.TextRenderingMode="ClearType"
+        RenderOptions.ClearTypeHint="Enabled"
+        RenderOptions.BitmapScalingMode="HighQuality"
+        Deactivated="Window_Deactivated" KeyDown="Window_KeyDown">
+    <Border Margin="12" Padding="12" Background="#FFF3F3F3" CornerRadius="12"
+            BorderBrush="#FFD6D6D6" BorderThickness="1">
+        <Border.Effect>
+            <DropShadowEffect BlurRadius="14" ShadowDepth="2" Opacity="0.3" RenderingBias="Performance" />
+        </Border.Effect>
+        <StackPanel>
+            <TextBlock Text="Audio Router" Foreground="#FF202020" FontSize="16"
+                       FontWeight="SemiBold" Margin="2,0,0,10" />
+            <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="420">
+                <StackPanel x:Name="AppList" />
+            </ScrollViewer>
+            <TextBlock x:Name="EmptyText" Foreground="#FF666666" TextWrapping="Wrap"
+                       Text="Chưa có app nào đang có phiên âm thanh. Hãy mở nhạc hoặc game rồi bấm lại icon."
+                       Visibility="Collapsed" />
+            <TextBlock x:Name="StatusText" Foreground="#FF2E7D32" Margin="2,6,0,0"
+                       TextWrapping="Wrap" />
+        </StackPanel>
+    </Border>
+</Window>

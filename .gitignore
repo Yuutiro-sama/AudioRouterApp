@@ -1,0 +1,46 @@
+## Build Results
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+## Visual Studio & IDE files
+.vs/
+*.user
+*.userosscache
+*.suo
+*.userprefs
+*.sln.docstates
+*.ide/
+.idea/
+.vscode/
+
+## Publish & Distribution Folders
+Publish/
+PublishSingleFile/
+publish/
+[Aa]pp[Pp]ackages/
+_UpgradeReport_Files/
+
+## Security & Sensitive Information
+*.env
+*.env.*
+*.secret
+*.key
+*.pfx
+*.cer
+*.pem
+credentials.json
+appsettings.Development.json
+appsettings.Local.json
+*.log
+
+## OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msm
+*.msp
