@@ -602,12 +602,33 @@ unsafe extern "system" fn flyout_wndproc(
                                 let app = &mut state.apps[b.app_index];
                                 app.current_device_id = dev.id.clone();
 
-                                // Save rule to %AppData%\AudioRouter\rules.json
+                                // 1. Apply routing immediately and synchronously for this PID and all sibling PIDs
+                                if let Ok(factory) = crate::audio::policy_config::get_policy_config_factory() {
+                                    let _ = crate::audio::policy_config::set_app_output_device(
+                                        &factory,
+                                        app.pid,
+                                        windows::Win32::Media::Audio::eRender,
+                                        Some(&dev.id),
+                                    );
+                                    let sibling_pids = crate::audio::enumerator::get_pids_by_process_name(&app.name);
+                                    for pid in sibling_pids {
+                                        if pid != app.pid {
+                                            let _ = crate::audio::policy_config::set_app_output_device(
+                                                &factory,
+                                                pid,
+                                                windows::Win32::Media::Audio::eRender,
+                                                Some(&dev.id),
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // 2. Save rule to %AppData%\AudioRouter\rules.json
                                 let mut rules = load_rules();
                                 rules.insert(app.name.clone(), dev.id.clone());
                                 let _ = save_rules(&rules);
 
-                                // Notify owner window to trigger routing update
+                                // 3. Notify owner window to trigger background state update
                                 let _ = PostMessageW(
                                     state.owner_hwnd,
                                     WM_APP_APPLY_RULES,

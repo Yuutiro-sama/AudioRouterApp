@@ -11,7 +11,8 @@ use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, DEVICE_STATE_ACTIVE, IAudioSessionControl2,
     IAudioSessionManager2, IMMDevice, IMMDeviceCollection,
-    IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, AudioSessionStateExpired,
+    IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, AudioSessionStateActive,
+    AudioSessionStateExpired,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ,
@@ -230,8 +231,12 @@ pub fn get_active_app_sessions(devices: &[AudioDevice]) -> Vec<AppAudioSession> 
                     }
                 }
 
+                let is_active = control.GetState().map(|s| s == AudioSessionStateActive).unwrap_or(false);
+
                 if let Some(existing) = session_map.get_mut(&pid) {
-                    // Update volume/mute if newer or active
+                    if is_active {
+                        existing.current_device_id = dev.id.clone();
+                    }
                     existing.volume = volume;
                     existing.muted = muted;
                 } else {
@@ -252,9 +257,58 @@ pub fn get_active_app_sessions(devices: &[AudioDevice]) -> Vec<AppAudioSession> 
         }
     }
 
+    // Query explicit persisted endpoint from Windows Audio Policy if registered
+    if let Ok(factory) = crate::audio::policy_config::get_policy_config_factory() {
+        for session in session_map.values_mut() {
+            if let Ok(Some(persisted_id)) = crate::audio::policy_config::get_app_output_device(
+                &factory,
+                session.pid,
+                eRender,
+                windows::Win32::Media::Audio::eMultimedia,
+            ) {
+                session.current_device_id = persisted_id;
+            }
+        }
+    }
+
     let mut sessions: Vec<AppAudioSession> = session_map.into_values().collect();
     sessions.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     sessions
+}
+
+/// Queries all process IDs matching a given process/executable name (case-insensitive).
+pub fn get_pids_by_process_name(name: &str) -> Vec<u32> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+
+    let mut pids = Vec::new();
+    let name_lower = name.to_lowercase();
+    let name_no_ext = name_lower.strip_suffix(".exe").unwrap_or(&name_lower);
+
+    unsafe {
+        if let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            let mut entry = PROCESSENTRY32W {
+                dwSize: core::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            if Process32FirstW(snapshot, &mut entry).is_ok() {
+                loop {
+                    let exe_name = String::from_utf16_lossy(&entry.szExeFile);
+                    let exe_trimmed = exe_name.trim_matches('\0').to_lowercase();
+                    let exe_no_ext = exe_trimmed.strip_suffix(".exe").unwrap_or(&exe_trimmed);
+                    if exe_no_ext == name_no_ext {
+                        pids.push(entry.th32ProcessID);
+                    }
+                    if Process32NextW(snapshot, &mut entry).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = CloseHandle(snapshot);
+        }
+    }
+    pids
 }
 
 /// Sets the volume level for a specific application audio session by PID.

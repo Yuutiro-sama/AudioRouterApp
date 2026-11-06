@@ -10,7 +10,7 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
 use crate::audio::enumerator::{
-    enumerate_render_devices, get_active_app_sessions, AudioDevice,
+    enumerate_render_devices, get_active_app_sessions, get_pids_by_process_name, AudioDevice,
 };
 use crate::audio::notification::{
     register_device_hotplug, unregister_device_hotplug, DeviceHotplugClient,
@@ -87,6 +87,26 @@ impl AppState {
         save_rules(&self.rules)
     }
 
+    /// Case-insensitive, extension-tolerant rule lookup.
+    pub fn get_rule(&self, app_name: &str) -> Option<&String> {
+        let name_lower = app_name.to_lowercase();
+        if let Some(val) = self.rules.get(&name_lower) {
+            return Some(val);
+        }
+        if let Some(val) = self.rules.get(app_name) {
+            return Some(val);
+        }
+        let name_no_ext = name_lower.strip_suffix(".exe").unwrap_or(&name_lower);
+        for (k, v) in &self.rules {
+            let k_lower = k.to_lowercase();
+            let k_no_ext = k_lower.strip_suffix(".exe").unwrap_or(&k_lower);
+            if k_no_ext == name_no_ext {
+                return Some(v);
+            }
+        }
+        None
+    }
+
     /// Iterates through all active application audio sessions and applies persisted rules.
     ///
     /// If `force` is true, re-applies routing even if the session currently matches the rule.
@@ -96,8 +116,7 @@ impl AppState {
         let sessions = get_active_app_sessions(&self.devices);
 
         for session in &sessions {
-            let app_name_lower = session.name.to_lowercase();
-            if let Some(target_dev_id) = self.rules.get(&app_name_lower).cloned() {
+            if let Some(target_dev_id) = self.get_rule(&session.name).cloned() {
                 if force || session.current_device_id != target_dev_id {
                     let res = set_app_output_device(
                         &self.factory,
@@ -107,6 +126,18 @@ impl AppState {
                     );
                     if res.is_ok() {
                         count += 1;
+                    }
+                    // Also route any other PIDs belonging to this application
+                    let sibling_pids = get_pids_by_process_name(&session.name);
+                    for pid in sibling_pids {
+                        if pid != session.pid {
+                            let _ = set_app_output_device(
+                                &self.factory,
+                                pid,
+                                eRender,
+                                Some(&target_dev_id),
+                            );
+                        }
                     }
                 }
             }
@@ -121,14 +152,24 @@ impl AppState {
 
         for session in sessions {
             if session.pid == pid {
-                let app_name_lower = session.name.to_lowercase();
-                if let Some(target_dev_id) = self.rules.get(&app_name_lower) {
+                if let Some(target_dev_id) = self.get_rule(&session.name) {
                     let res = set_app_output_device(
                         &self.factory,
                         session.pid,
                         eRender,
                         Some(target_dev_id),
                     );
+                    let sibling_pids = get_pids_by_process_name(&session.name);
+                    for s_pid in sibling_pids {
+                        if s_pid != session.pid {
+                            let _ = set_app_output_device(
+                                &self.factory,
+                                s_pid,
+                                eRender,
+                                Some(target_dev_id),
+                            );
+                        }
+                    }
                     return res.is_ok();
                 }
                 break;

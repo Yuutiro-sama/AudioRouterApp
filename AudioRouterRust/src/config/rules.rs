@@ -56,6 +56,26 @@ impl RulesConfig {
         self.rules.get(app_name)
     }
 
+    /// Case-insensitive, extension-tolerant lookup (matches "brave", "brave.exe", "Brave.exe").
+    pub fn get_rule(&self, app_name: &str) -> Option<&String> {
+        let name_lower = app_name.to_lowercase();
+        if let Some(val) = self.rules.get(&name_lower) {
+            return Some(val);
+        }
+        if let Some(val) = self.rules.get(app_name) {
+            return Some(val);
+        }
+        let name_no_ext = name_lower.strip_suffix(".exe").unwrap_or(&name_lower);
+        for (k, v) in &self.rules {
+            let k_lower = k.to_lowercase();
+            let k_no_ext = k_lower.strip_suffix(".exe").unwrap_or(&k_lower);
+            if k_no_ext == name_no_ext {
+                return Some(v);
+            }
+        }
+        None
+    }
+
     pub fn insert(&mut self, app_name: String, device_id: String) {
         self.rules.insert(app_name, device_id);
     }

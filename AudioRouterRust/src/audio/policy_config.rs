@@ -6,7 +6,7 @@
 use core::ffi::c_void;
 use windows::core::{GUID, HRESULT, HSTRING, IInspectable, IInspectable_Vtbl, Interface};
 use windows::Win32::Media::Audio::{
-    eCommunications, eConsole, eMultimedia, eRender, EDataFlow, ERole,
+    eConsole, eMultimedia, eRender, EDataFlow, ERole,
 };
 use windows::Win32::System::WinRT::RoGetActivationFactory;
 
@@ -47,9 +47,7 @@ impl core::ops::Deref for IAudioPolicyConfigFactory {
 #[allow(non_snake_case)]
 pub struct IAudioPolicyConfigFactory_Vtbl {
     pub base__: IInspectable_Vtbl, // Slots 0 -> 5 (3 IUnknown + 3 IInspectable)
-    // 25 unpublished internal methods of the OS (Slots 6 -> 30)
-    pub padding_slots: [usize; 25],
-    // 19 Volume Group & Chat Context methods (Slots 31 -> 49)
+    // 19 Volume Group & Chat Context methods (Slots 6 -> 24)
     pub add_ctx_volume_changed: usize,
     pub remove_ctx_volume_changed: usize,
     pub add_ringer_vibrate_state_changed: usize,
@@ -69,7 +67,7 @@ pub struct IAudioPolicyConfigFactory_Vtbl {
     pub get_current_chat_applications: usize,
     pub add_chat_context_changed: usize,
     pub remove_chat_context_changed: usize,
-    // 3 core routing methods (Slots 50, 51, 52)
+    // 3 core routing methods (Slots 25, 26, 27)
     pub SetPersistedDefaultAudioEndpoint: unsafe extern "system" fn(
         this: *mut c_void,
         process_id: u32,
@@ -141,7 +139,7 @@ pub fn set_app_output_device(
         _ => HSTRING::new(),
     };
 
-    let roles = [eConsole, eMultimedia, eCommunications];
+    let roles = [eConsole, eMultimedia];
     for role in roles {
         unsafe {
             let hstring_raw: *mut c_void = core::mem::transmute_copy(&formatted_hstring);
@@ -223,10 +221,18 @@ mod tests {
     fn test_vtable_layout_size() {
         use std::mem::size_of;
         // base__: 6 pointers (3 IUnknown + 3 IInspectable)
-        // padding: 25 pointers
         // volume/chat: 19 pointers
         // routing: 3 pointers
-        // Total slots: 6 + 25 + 19 + 3 = 53 function pointers
-        assert_eq!(size_of::<IAudioPolicyConfigFactory_Vtbl>(), 53 * size_of::<usize>());
+        // Total slots: 6 + 19 + 3 = 28 function pointers
+        assert_eq!(size_of::<IAudioPolicyConfigFactory_Vtbl>(), 28 * size_of::<usize>());
+    }
+
+    #[test]
+    fn test_live_factory_instantiation() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        let factory = get_policy_config_factory();
+        assert!(factory.is_ok(), "Failed to get AudioPolicyConfig activation factory: {:?}", factory.err());
     }
 }
