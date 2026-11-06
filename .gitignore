@@ -35,6 +35,12 @@ appsettings.Development.json
 appsettings.Local.json
 *.log
 
+## Rust Build Artifacts & Standalone Binaries
+AudioRouterRust/target/
+**/target/
+*.exe
+plan.md
+
 ## OS generated files
 Thumbs.db
 ehthumbs.db

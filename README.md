@@ -2,12 +2,13 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-lightgrey.svg)](https://microsoft.com/windows)
-[![.NET](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
-[![Memory Footprint](https://img.shields.io/badge/RAM-%3C%205%20MB-brightgreen.svg)](#-ưu-điểm-nổi-bật)
+[![Rust](https://img.shields.io/badge/Rust-Native%20Win32%2FCOM-orange.svg)](https://www.rust-lang.org/)
+[![Binary Size](https://img.shields.io/badge/Binary-~357%20KB-success.svg)](#-ưu-điểm-nổi-bật)
+[![Memory Footprint](https://img.shields.io/badge/RAM-%3C%201.5%20MB-brightgreen.svg)](#-ưu-điểm-nổi-bật)
 
 > [!NOTE]  
 > **Tuyên bố về AI và tính thương mại:**  
-> Dự án này được phát triển với sự hỗ trợ của các mô hình AI phục vụ mục đích nghiên cứu, học tập và thử nghiệm ý tưởng (PoC). Mã nguồn và tài liệu do AI sinh ra chỉ đóng vai trò là khung tham khảo; dự án không được thiết kế sẵn cho mục đích thương mại trực tiếp và chưa được kiểm thử toàn diện cho môi trường vận hành thực tế (production).
+> Dự án này được phát triển với sự hỗ trợ của các mô hình AI phục vụ mục đích nghiên cứu, học tập và thử nghiệm ý tưởng (PoC). Mã nguồn và tài liệu do AI sinh ra đóng vai trò là khung tham khảo; dự án không được thiết kế sẵn cho mục đích thương mại trực tiếp và chưa được kiểm thử toàn diện cho môi trường vận hành thực tế (production).
 >
 > **AI and Commercial Disclaimer:**  
 > This project was developed with the assistance of AI models for research, educational, and Proof-of-Concept (PoC) purposes. The AI-generated source code and documentation serve as a reference framework; this project is not designed for direct commercial deployment and has not been extensively tested for production environments.
@@ -20,111 +21,110 @@
 
 ## 🇻🇳 Tiếng Việt
 
-**Audio Router App** là một tiện ích mã nguồn mở nhỏ gọn dành cho Windows (xây dựng trên **WPF / .NET 10**), cho phép bạn định tuyến âm thanh của từng ứng dụng riêng biệt đến các thiết bị phát khác nhau (tai nghe, loa ngoài, USB DAC, thiết bị ảo), tùy chỉnh âm lượng từng app và tự động khôi phục cấu hình ngay khi cắm hoặc rút thiết bị.
+**Audio Router App** là tiện ích mã nguồn mở siêu nhẹ dành cho Windows, cho phép định tuyến âm thanh của từng ứng dụng riêng biệt đến các thiết bị phát khác nhau (tai nghe, loa ngoài, USB DAC, thiết bị âm thanh ảo), điều chỉnh âm lượng từng app và tự động khôi phục cấu hình ngay khi cắm hoặc rút thiết bị.
+
+> [!TIP]
+> **Phiên bản mới (v2.0) được viết lại hoàn toàn bằng ngôn ngữ Rust thuần (Native Win32/COM)**, giúp giảm dung lượng file thực thi từ 72 MB xuống chỉ còn **~357 KB** và mức tiêu thụ RAM chạy nền chỉ còn **< 1.5 MB**! (Mã nguồn C# .NET 10 ban đầu vẫn được lưu trữ song song trong repo).
 
 ### ⚡ Ưu điểm nổi bật
 
-- 🚀 **Siêu nhẹ - Chỉ tốn < 5 MB RAM khi chạy nền**: Ứng dụng được tối ưu hóa sâu với bộ đệm Win32 (`ProcessInfoCache`, `IconCache`) và giải phóng tài nguyên triệt để, chiếm chưa tới **5 MB RAM** và gần như **0% CPU** khi ẩn dưới khay hệ thống (System Tray). Bạn hoàn toàn yên tâm treo máy chơi game hoặc làm việc nặng mà không lo tốn tài nguyên.
-- 🎯 **Định tuyến âm thanh độc lập từng app**: Cho phép nghe nhạc từ trình duyệt qua tai nghe, phát game ra loa ngoài hoặc chuyển âm thanh Discord sang tai nghe đàm thoại mà không bị lẫn lộn.
+- 🚀 **Siêu nhẹ - File chạy chỉ ~357 KB, tiêu thụ < 1.5 MB RAM**: 
+  - Hoàn toàn độc lập, không cần cài đặt .NET Runtime, Visual C++ Redistributable hay bất kỳ phần mềm phụ trợ nào.
+  - Khi ẩn ở khay hệ thống (System Tray), app chỉ tốn khoảng **1.0 - 1.5 MB RAM** và **0% CPU**.
+- 🎯 **Định tuyến âm thanh độc lập từng app**: Nghe nhạc từ trình duyệt qua tai nghe, phát nhạc game ra loa ngoài hoặc chuyển âm thanh Discord sang tai nghe đàm thoại riêng biệt.
 - 🔌 **Tự động nhận diện khi cắm/rút thiết bị (Hardware Hotplug)**:
-  - Tích hợp lắng nghe sự kiện từ Windows Core Audio (`IMMNotificationClient`).
-  - Khi bạn rút tai nghe, Windows tự chuyển âm thanh tạm thời về loa; khi bạn cắm lại, app tự động khôi phục âm thanh về đúng thiết bị đó ngay lập tức (kèm bộ lọc chống xung đột tín hiệu).
-- 🎚️ **Bộ trộn âm lượng (Per-App Volume & Mute)**: Điều chỉnh âm lượng và bật/tắt tiếng từng ứng dụng trực tiếp trên popup khay hệ thống, không cần vào Windows Settings rườm rà.
-- 💾 **Tự động ghi nhớ cấu hình**: Lưu quy tắc vào `%AppData%\AudioRouter\rules.json` và tự áp dụng lại bất cứ khi nào ứng dụng đó mở lên.
-- ⏰ **Khởi động cùng Windows tiện lợi**: Bật/tắt tự khởi động trực tiếp qua menu chuột phải khay hệ thống, hoàn toàn không đòi hỏi quyền Administrator.
+  - Lắng nghe trực tiếp sự kiện từ Windows Core Audio (`IMMNotificationClient`).
+  - Tự động ghi nhớ và khôi phục âm thanh về đúng tai nghe/DAC ngay khi cắm lại mà không cần cấu hình lại bằng tay.
+- 🎚️ **Bộ trộn âm lượng (Per-App Volume & Mute)**: Điều chỉnh thanh trượt âm lượng và nút tắt tiếng từng ứng dụng trực tiếp trên bảng điều khiển khay hệ thống.
+- 💾 **Tự động ghi nhớ cấu hình**: Lưu quy tắc vào `%AppData%\AudioRouter\rules.json` và tự động áp dụng lại mỗi khi ứng dụng đó phát âm thanh.
+- ⏰ **Khởi động cùng Windows**: Tích hợp menu chuột phải bật/tắt tự khởi động cùng máy tính, không đòi hỏi quyền Administrator.
 
 ### 🛡️ Bảo mật & Quyền riêng tư
 
-- **100% Ngoại tuyến (Offline)**: Ứng dụng không gửi hay nhận bất kỳ gói tin mạng nào, không chứa mã theo dõi hay phân tích hành vi người dùng (No Telemetry).
-- **Nguyên tắc đặc quyền tối thiểu (Least Privilege)**: Chạy hoàn toàn dưới quyền người dùng thông thường (`PROCESS_QUERY_LIMITED_INFORMATION`), không yêu cầu Admin hay can thiệp sâu vào nhân hệ điều hành.
-- **An toàn dữ liệu**: Chỉ lưu tên tiến trình và mã thiết bị trên ổ cứng cá nhân của bạn. Xem chi tiết tại [SECURITY.md](SECURITY.md).
+- **100% Ngoại tuyến (Offline)**: Hoàn toàn không kết nối internet, không thu thập dữ liệu (No Telemetry).
+- **Nguyên tắc đặc quyền tối thiểu (Least Privilege)**: Chạy hoàn toàn dưới quyền người dùng thông thường (`PROCESS_QUERY_LIMITED_INFORMATION`), không yêu cầu Run as Administrator.
+- **An toàn dữ liệu**: Dữ liệu cấu hình chỉ lưu trữ cục bộ trên máy tính cá nhân.
 
 ### 📋 Yêu cầu hệ thống
 
-- **Hệ điều hành**: Windows 10 (bản 1809 trở lên) hoặc Windows 11 (64-bit).
-- **Môi trường chạy**:
-  - Với bản thông thường: Cần cài đặt [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0).
-  - Với bản đóng gói 1 file duy nhất (Single-File Self-Contained): Không cần cài bất kỳ phần mềm nào khác, mở lên chạy ngay.
+- **Hệ điều hành**: Windows 10 (bản 1903 trở lên) hoặc Windows 11 (64-bit).
+- **Phần mềm phụ trợ**: **Không cần cài đặt thêm bất cứ gì** khi tải file `AudioRouter.exe` (Rust release).
 
 ### 🛠️ Hướng dẫn build từ mã nguồn
 
+#### 1. Bản Rust Native (Khuyên dùng - 357 KB, < 1.5 MB RAM)
 ```bash
-# 1. Clone repository
-git clone https://github.com/yuutiro/AudioRouterApp.git
-cd AudioRouterApp
+# Clone repository
+git clone https://github.com/Yuutiro-sama/AudioRouterApp.git
+cd AudioRouterApp/AudioRouterRust
 
-# 2. Build bản Debug
-dotnet build
+# Chạy kiểm thử tự động
+cargo test
 
-# 3. Đóng gói ra 1 file exe duy nhất (không cần cài .NET)
-dotnet publish AudioRouterApp/AudioRouterApp.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o ./PublishSingleFile
+# Build bản Release tối ưu cao nhất
+cargo build --release
 ```
-File thực thi độc lập sẽ xuất hiện tại thư mục `./PublishSingleFile/AudioRouterApp.exe`.
+File thực thi độc lập sẽ nằm tại `AudioRouterRust/target/release/AudioRouter.exe`.
+
+#### 2. Bản C# .NET 10 WPF (Bản gốc)
+```bash
+cd AudioRouterApp
+dotnet build
+dotnet publish AudioRouterApp.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o ./PublishSingleFile
+```
 
 ### 🚀 Hướng dẫn sử dụng
 
-1. Chạy file `AudioRouterApp.exe`.
-2. Biểu tượng loa màu xanh sẽ xuất hiện dưới góc phải thanh Taskbar (khay hệ thống).
-3. Nhấp chuột trái vào biểu tượng để mở bảng điều khiển.
-4. Chọn thiết bị âm thanh mong muốn cho từng phần mềm đang phát âm thanh.
+1. Tải file `AudioRouter.exe` từ mục [Releases](https://github.com/Yuutiro-sama/AudioRouterApp/releases).
+2. Chạy file `AudioRouter.exe`.
+3. Biểu tượng loa sẽ xuất hiện ở khay hệ thống (System Tray, góc dưới bên phải màn hình).
+4. Nhấp chuột trái vào biểu tượng để mở bảng điều chỉnh thiết bị và âm lượng cho từng ứng dụng.
 
 ---
 
 ## 🇬🇧 English
 
-**Audio Router App** is a lightweight, modern Windows desktop utility built with **WPF (.NET 10)** that allows you to route audio from specific applications to specific output devices (headphones, speakers, DACs, virtual cables) independently, adjust per-app volume, and automatically restore routing when devices are plugged or unplugged.
+**Audio Router App** is a high-performance, ultra-lightweight Windows utility that routes audio from specific applications to specific output devices (headphones, speakers, DACs, virtual audio cables) independently, adjusts per-app volume, and automatically restores routing when devices are connected or disconnected.
 
-### ⚡ Key Advantages & Features
+> [!TIP]
+> **Version 2.0 has been completely rewritten in native Rust (Win32/COM)**, slashing executable size from 72 MB down to just **~357 KB**, and idling background RAM footprint to **< 1.5 MB**! (The original C# .NET 10 source code remains available in this repository).
 
-- 🚀 **Ultra-Lightweight (< 5 MB RAM Background Footprint)**: Deeply optimized using low-level Win32 process metadata caching (`ProcessInfoCache`), frozen bitmap caching (`IconCache`), and aggressive resource cleanup. Consumes **< 5 MB RAM** and near **0% CPU** while idling in the System Tray, ensuring zero impact on gaming or heavy workloads.
+### ⚡ Key Features
+
+- 🚀 **Ultra-Lightweight (~357 KB Executable, < 1.5 MB Idle RAM)**: Zero external runtimes required (no .NET Runtime or VC++ Redistributable needed). Uses zero CPU when idling in system tray.
 - 🎯 **Per-Application Audio Routing**: Direct sound from Chrome to headphones, Spotify to speakers, or a game to a dedicated DAC.
-- 🔌 **Smart Hardware Hotplug Detection**:
-  - Implements native Windows Core Audio callbacks (`IMMNotificationClient`).
-  - Seamlessly and automatically restores per-app routing rules when a headset or USB DAC is reconnected, complete with event debouncing.
-- 🎚️ **Per-App Volume & Mute**: Fine-tune volume sliders or toggle mute for individual running applications directly from a sleek tray popup.
-- 💾 **Persistent Routing Rules**: Automatically persists your preferences in `%AppData%\AudioRouter\rules.json` and enforces them whenever target apps launch.
-- ⏰ **Start with Windows**: Toggle autostart cleanly via user registry without requiring administrator privileges.
+- 🔌 **Smart Hardware Hotplug Detection**: Native Windows Core Audio callbacks (`IMMNotificationClient`) automatically re-enforce custom routing when devices are reconnected.
+- 🎚️ **Per-App Volume & Mute**: Fine-tune volume sliders or toggle mute for individual running applications directly from the sleek tray flyout.
+- 💾 **Persistent Routing Rules**: Persists rules to `%AppData%\AudioRouter\rules.json` and reapplies them whenever applications launch.
+- ⏰ **Start with Windows**: Toggle autostart via user registry without requiring administrator privileges.
 
 ### 🛡️ Security & Privacy
 
-- **100% Offline**: No network requests, no telemetry, no tracking, no analytics.
-- **Least Privilege**: Runs entirely under standard user privileges (`PROCESS_QUERY_LIMITED_INFORMATION`), without requiring Administrator rights.
-- **Safe Local Storage**: Only process names and endpoint device IDs are saved locally. See [SECURITY.md](SECURITY.md) for details.
+- **100% Offline**: No network calls, zero telemetry, zero tracking.
+- **Least Privilege**: Runs under standard user privileges (`PROCESS_QUERY_LIMITED_INFORMATION`), without requiring Administrator rights.
+- **Local Storage**: Routing rules are stored strictly on your local disk.
 
 ### 📋 System Requirements
 
-- **Operating System**: Windows 10 (version 1809+ / 21H2+) or Windows 11 (64-bit).
-- **Runtime**:
-  - For standard build: [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0)
-  - For standalone single-file build: No additional runtime required.
+- **Operating System**: Windows 10 (1903+) or Windows 11 (64-bit).
+- **Dependencies**: None.
 
-### 🛠️ How to Build from Source
+### 🛠️ Building from Source
 
+#### 1. Rust Native Build (Recommended)
 ```bash
-# 1. Clone the repository
-git clone https://github.com/yuutiro/AudioRouterApp.git
-cd AudioRouterApp
-
-# 2. Build Debug
-dotnet build
-
-# 3. Publish Single-File Executable (Standalone, Self-Contained)
-dotnet publish AudioRouterApp/AudioRouterApp.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o ./PublishSingleFile
+git clone https://github.com/Yuutiro-sama/AudioRouterApp.git
+cd AudioRouterApp/AudioRouterRust
+cargo test
+cargo build --release
 ```
-The resulting standalone executable will be located in `./PublishSingleFile/AudioRouterApp.exe`.
+The optimized executable will be generated at `AudioRouterRust/target/release/AudioRouter.exe`.
 
-### 🚀 How to Run
-
-1. Launch `AudioRouterApp.exe`.
-2. Look for the blue speaker icon in your Windows Taskbar System Tray (near the clock).
-3. Click the icon to view all active audio applications.
-4. Select the desired audio output device from the dropdown menu for any app.
-
-### 🏗️ Architecture Overview
-
-- **Core Audio Routing**: Communicates with internal Windows Audio Policy via undocumented COM factory `Windows.Media.Internal.AudioPolicyConfig` (`SetPersistedDefaultAudioEndpoint`).
-- **Audio Sessions**: Managed via `NAudio.CoreAudioApi` (`MMDeviceEnumerator`, `AudioSessionManager`).
-- **Device State Monitoring**: Custom COM implementation of `IMMNotificationClient` registered with Windows Core Audio MMDevAPI.
+#### 2. C# .NET 10 Build
+```bash
+cd AudioRouterApp
+dotnet build
+```
 
 ---
 
