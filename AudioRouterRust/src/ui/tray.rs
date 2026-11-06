@@ -1,12 +1,15 @@
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
+use windows::Win32::Graphics::Gdi::{
+    CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS,
+};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ,
 };
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP,
+    Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP,
     NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
     NOTIFYICON_VERSION_4,
 };
@@ -146,13 +149,36 @@ pub fn create_speaker_icon() -> Result<HICON, windows::core::Error> {
     }
 
     unsafe {
-        let hbm_color = CreateBitmap(
-            WIDTH as i32,
-            HEIGHT as i32,
-            1,
-            32,
-            Some(pixels.as_ptr() as *const _),
-        );
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: WIDTH as i32,
+                biHeight: -(HEIGHT as i32), // negative for top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let hbm_color = CreateDIBSection(
+            None,
+            &bmi,
+            DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        )?;
+
+        if !bits.is_null() {
+            std::ptr::copy_nonoverlapping(
+                pixels.as_ptr(),
+                bits as *mut u32,
+                WIDTH * HEIGHT,
+            );
+        }
 
         let mask_bytes = [0u8; (WIDTH * HEIGHT) / 8];
         let hbm_mask = CreateBitmap(
@@ -182,10 +208,10 @@ pub fn create_speaker_icon() -> Result<HICON, windows::core::Error> {
 
 /// System Tray Icon controller
 pub struct TrayIcon {
-    hwnd: HWND,
-    nid: NOTIFYICONDATAW,
-    icon: HICON,
-    is_added: bool,
+    pub hwnd: HWND,
+    pub nid: NOTIFYICONDATAW,
+    pub icon: HICON,
+    pub is_added: bool,
 }
 
 impl TrayIcon {
@@ -199,7 +225,7 @@ impl TrayIcon {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
             uID: Self::TRAY_ICON_ID,
-            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage: callback_msg,
             hIcon: icon,
             ..Default::default()
@@ -211,9 +237,6 @@ impl TrayIcon {
         nid.szTip[..len].copy_from_slice(&wide_tip[..len]);
         nid.szTip[len] = 0;
 
-        // Set version 4 for modern Shell_NotifyIcon notifications
-        nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-
         Ok(Self {
             hwnd,
             nid,
@@ -222,11 +245,35 @@ impl TrayIcon {
         })
     }
 
-    /// Adds the icon to the notification area
+    /// Adds the icon to the notification area with retries and version negotiation
     pub fn add(&mut self) -> Result<(), windows::core::Error> {
         unsafe {
-            Shell_NotifyIconW(NIM_ADD, &self.nid).ok()?;
-            Shell_NotifyIconW(NIM_SETVERSION, &self.nid).ok()?;
+            let mut added = false;
+
+            // Attempt NIM_ADD with retry up to 10 times in case Explorer is initializing
+            for _ in 0..10 {
+                let res = Shell_NotifyIconW(NIM_ADD, &self.nid);
+                if res.as_bool() {
+                    added = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+
+            if !added {
+                return Err(windows::core::Error::from_win32());
+            }
+
+            // Negotiate NOTIFYICON_VERSION_4
+            let mut nid_ver = NOTIFYICONDATAW {
+                cbSize: self.nid.cbSize,
+                hWnd: self.hwnd,
+                uID: self.nid.uID,
+                ..Default::default()
+            };
+            nid_ver.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+            let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid_ver);
+
             self.is_added = true;
             Ok(())
         }
@@ -244,14 +291,12 @@ impl TrayIcon {
         let len = wide_tip.len().min(self.nid.szTip.len() - 1);
         self.nid.szTip[..len].copy_from_slice(&wide_tip[..len]);
         self.nid.szTip[len] = 0;
+        let orig_flags = self.nid.uFlags;
         self.nid.uFlags = NIF_TIP;
 
-        unsafe {
-            Shell_NotifyIconW(NIM_MODIFY, &self.nid).ok()?;
-            // Restore full flags
-            self.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-            Ok(())
-        }
+        let res = unsafe { Shell_NotifyIconW(NIM_MODIFY, &self.nid) };
+        self.nid.uFlags = orig_flags;
+        res.ok()
     }
 
     /// Removes the icon from the notification area

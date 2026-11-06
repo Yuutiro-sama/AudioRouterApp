@@ -51,6 +51,8 @@ struct DispatcherData {
 
 static LAST_TRAY_CLICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+const TIMER_ID_TRAY_RETRY: usize = 1002;
+
 /// Hidden dispatcher window procedure.
 ///
 /// Processes Shell notification callbacks, hotplug debounce timers, session events,
@@ -173,6 +175,14 @@ unsafe extern "system" fn dispatcher_wndproc(
                 data.app_state.debounce_timer_active = false;
                 data.app_state.refresh_devices();
                 data.app_state.apply_all_rules(false);
+            } else if wparam.0 == TIMER_ID_TRAY_RETRY {
+                if !data.tray_icon.is_added {
+                    if data.tray_icon.add().is_ok() {
+                        let _ = KillTimer(hwnd, TIMER_ID_TRAY_RETRY);
+                    }
+                } else {
+                    let _ = KillTimer(hwnd, TIMER_ID_TRAY_RETRY);
+                }
             }
             LRESULT(0)
         }
@@ -194,6 +204,23 @@ fn main() -> windows::core::Result<()> {
     let mutex_name = w!("AudioRouterApp_SingleInstance");
     let mutex_handle = unsafe { CreateMutexW(None, true, mutex_name) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        // If an instance is already running, ping it to toggle/show the UI!
+        unsafe {
+            let existing_hwnd = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
+                w!("AudioRouterDispatcherClass"),
+                None,
+            );
+            if let Ok(h) = existing_hwnd {
+                if !h.is_invalid() {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        h,
+                        windows::Win32::UI::WindowsAndMessaging::WM_COMMAND,
+                        WPARAM(crate::ipc_messages::IDM_SHOW_UI as usize),
+                        LPARAM(0),
+                    );
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -243,7 +270,13 @@ fn main() -> windows::core::Result<()> {
     // 6. Initialize AppState, TrayIcon, and Taskbar message subscription
     let mut app_state = AppState::new(hwnd)?;
     let mut tray_icon = TrayIcon::new(hwnd, WM_APP_TRAY, "Audio Router")?;
-    let _ = tray_icon.add();
+    if tray_icon.add().is_err() {
+        // Arm 1-second retry timer in case shell notification tray is initializing
+        unsafe {
+            let _ = SetTimer(hwnd, TIMER_ID_TRAY_RETRY, 1000, None);
+        }
+    }
+
     let taskbar_created_msg = register_taskbar_created_message();
 
     // Initial pass to enforce active rules on current running audio sessions
