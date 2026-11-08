@@ -5,38 +5,41 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, DeleteObject, GetMonitorInfoW, MonitorFromPoint,
-    SetBkColor, SetBkMode, SetTextColor, UpdateWindow, HBRUSH, HDC, HFONT, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, TRANSPARENT,
+    CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, GetMonitorInfoW,
+    InvalidateRect, MonitorFromPoint, RoundRect, SelectObject, SetBkColor, SetBkMode,
+    SetTextColor, UpdateWindow, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::ProcessStatus::K32EmptyWorkingSet;
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
-    TBM_SETPOS, TBM_SETRANGE, TBS_AUTOTICKS, TBS_HORZ,
+    InitCommonControlsEx, SetScrollInfo, DRAWITEMSTRUCT, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES,
+    INITCOMMONCONTROLSEX, ODS_SELECTED, TBM_SETPOS, TBM_SETRANGE, TBS_AUTOTICKS, TBS_HORZ,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE};
-use windows::Win32::UI::Shell::ExtractIconExW;
+use windows::Win32::UI::Shell::{DefSubclassProc, ExtractIconExW, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetCursorPos,
-    GetDlgCtrlID, GetWindowLongPtrW, GetWindowThreadProcessId, KillTimer, PostMessageW,
+    BeginDeferWindowPos, CreateWindowExW, DefWindowProcW, DeferWindowPos, DestroyIcon,
+    DestroyWindow, EndDeferWindowPos, GetClientRect, GetCursorPos, GetDlgCtrlID, GetParent,
+    GetScrollInfo, GetWindowLongPtrW, GetWindowThreadProcessId, KillTimer, PostMessageW,
     RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, SetWindowTextW, ShowWindow,
-    BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_PUSHBUTTON,
-    CBS_DROPDOWNLIST, CBN_CLOSEUP, CBN_DROPDOWN,
-    CBN_SELCHANGE, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, HICON, HMENU, STM_SETICON, SW_SHOW, WA_INACTIVE, WINDOW_STYLE,
-    WM_ACTIVATE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC,
-    WM_DESTROY, WM_HSCROLL, WM_KEYDOWN, WM_SETFONT, WM_TIMER, WNDCLASSEXW,
-    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    SetWindowPos, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BN_CLICKED,
+    BS_AUTOCHECKBOX, BS_OWNERDRAW, CBS_DROPDOWNLIST, CBN_CLOSEUP, CBN_DROPDOWN, CBN_SELCHANGE,
+    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
+    HICON, HMENU, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION,
+    SB_THUMBTRACK, SB_VERT, SCROLLINFO, SIF_ALL, SIF_PAGE, SIF_POS, SIF_RANGE, STM_SETICON,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_COMMAND,
+    WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND,
+    WM_HSCROLL, WM_KEYDOWN, WM_MOUSEWHEEL, WM_SETFONT, WM_TIMER, WM_VSCROLL, WNDCLASSEXW,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 const BST_UNCHECKED: usize = 0;
@@ -54,6 +57,31 @@ const SS_LEFT: WINDOW_STYLE = WINDOW_STYLE(0x00000000);
 const SS_CENTER: WINDOW_STYLE = WINDOW_STYLE(0x00000001);
 const SS_RIGHT: WINDOW_STYLE = WINDOW_STYLE(0x00000002);
 const SS_ICON: WINDOW_STYLE = WINDOW_STYLE(0x00000003);
+
+/// Subclass function to suppress wheel changes on Sliders and ComboBoxes,
+/// and forward the wheel event to the parent flyout window for smooth scrolling.
+unsafe extern "system" fn no_wheel_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    if msg == WM_MOUSEWHEEL {
+        let flyout_raw = CURRENT_FLYOUT.load(Ordering::SeqCst);
+        if flyout_raw != 0 {
+            return SendMessageW(HWND(flyout_raw as _), msg, wparam, lparam);
+        }
+        if let Ok(parent) = GetParent(hwnd) {
+            if !parent.is_invalid() && !parent.0.is_null() {
+                return SendMessageW(parent, msg, wparam, lparam);
+            }
+        }
+        return LRESULT(0);
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
 
 /// Trims the working set of the current process to aggressively release memory back to the OS (< 2.5 MB)
 pub fn trim_background_memory() {
@@ -119,8 +147,23 @@ struct AppControlBinding {
     icon: Option<HICON>,
 }
 
+#[derive(Clone, Copy)]
+struct ChildLayout {
+    hwnd: HWND,
+    x: i32,
+    base_y: i32,
+    w: i32,
+    h: i32,
+}
+
 struct FlyoutState {
     owner_hwnd: HWND,
+    container_hwnd: HWND,
+    scale: f32,
+    scroll_y: i32,
+    max_scroll_y: i32,
+    container_h: i32,
+    scroll_children: Vec<ChildLayout>,
     devices: Vec<DeviceItem>,
     apps: Vec<AppAudioItem>,
     bg_brush: HBRUSH,
@@ -132,6 +175,40 @@ struct FlyoutState {
     is_dropdown_open: bool,
     device_bindings: Vec<DeviceControlBinding>,
     app_bindings: Vec<AppControlBinding>,
+}
+
+impl FlyoutState {
+    unsafe fn apply_scroll(&self) {
+        if !self.scroll_children.is_empty() {
+            if let Ok(mut hdwp) = BeginDeferWindowPos(self.scroll_children.len() as i32) {
+                for c in &self.scroll_children {
+                    let cur_y = c.base_y - self.scroll_y;
+                    if let Ok(next) = DeferWindowPos(
+                        hdwp,
+                        c.hwnd,
+                        HWND::default(),
+                        c.x,
+                        cur_y,
+                        c.w,
+                        c.h,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    ) {
+                        hdwp = next;
+                    }
+                }
+                let _ = EndDeferWindowPos(hdwp);
+            }
+
+            let si = SCROLLINFO {
+                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_POS,
+                nPos: self.scroll_y,
+                ..Default::default()
+            };
+            let _ = SetScrollInfo(self.container_hwnd, SB_VERT, &si, BOOL(1));
+            let _ = InvalidateRect(self.container_hwnd, None, BOOL(1));
+        }
+    }
 }
 
 unsafe fn create_ui_font(height: i32, weight: i32) -> HFONT {
@@ -243,6 +320,42 @@ pub fn close_flyout() {
     }
 }
 
+/// Container window procedure: delegates events and drawing up to the flyout window
+unsafe extern "system" fn container_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_COMMAND | WM_HSCROLL | WM_DRAWITEM | WM_MOUSEWHEEL | WM_VSCROLL => {
+            if let Ok(parent) = GetParent(hwnd) {
+                if !parent.is_invalid() && !parent.0.is_null() {
+                    return SendMessageW(parent, msg, wparam, lparam);
+                }
+            }
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLORDLG => {
+            if let Ok(parent) = GetParent(hwnd) {
+                if !parent.is_invalid() && !parent.0.is_null() {
+                    return SendMessageW(parent, msg, wparam, lparam);
+                }
+            }
+        }
+        WM_ERASEBKGND => {
+            let hdc = HDC(wparam.0 as _);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let brush = CreateSolidBrush(COLORREF(0x001E1E1E));
+            let _ = windows::Win32::Graphics::Gdi::FillRect(hdc, &rc, brush);
+            let _ = DeleteObject(brush);
+            return LRESULT(1);
+        }
+        _ => {}
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
 /// Toggles the flyout window: closes if visible, otherwise creates and displays it
 pub fn toggle_flyout(
     owner_hwnd: HWND,
@@ -300,8 +413,11 @@ pub fn toggle_flyout(
     }
 
     let class_name = w!("AudioRouterFlyoutClass");
+    let container_class = w!("AudioRouterContainerClass");
     unsafe {
         let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default();
+
+        // Register Flyout window class
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
@@ -313,8 +429,20 @@ pub fn toggle_flyout(
         };
         let _ = RegisterClassExW(&wc);
 
+        // Register Container window class
+        let cc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(container_wndproc),
+            hInstance: instance.into(),
+            lpszClassName: container_class,
+            hbrBackground: CreateSolidBrush(COLORREF(0x001E1E1E)),
+            ..Default::default()
+        };
+        let _ = RegisterClassExW(&cc);
+
         // Preliminary window to determine monitor DPI
-        let dummy_width = 420;
+        let dummy_width = 480;
         let dummy_height = 300;
         let (pos_x, pos_y) = calculate_flyout_position(dummy_width, dummy_height, tray_rect);
 
@@ -349,7 +477,7 @@ pub fn toggle_flyout(
             std::mem::size_of_val(&corner_pref) as u32,
         );
 
-        let dark_mode = windows::Win32::Foundation::BOOL(1);
+        let dark_mode = BOOL(1);
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -360,22 +488,32 @@ pub fn toggle_flyout(
         let dpi = GetDpiForWindow(hwnd);
         let scale = if dpi == 0 { 1.0f32 } else { dpi as f32 / 96.0f32 };
 
-        let width = (420.0 * scale) as i32;
-        let pad = (12.0 * scale) as i32;
-        let title_h = (28.0 * scale) as i32;
-        let sec_h = (22.0 * scale) as i32;
-        let dev_row_h = (52.0 * scale) as i32;
-        let app_card_h = (82.0 * scale) as i32;
+        // Requirements: Width increased to 480px * scale for comfortable spacing & bigger fonts
+        let width = (480.0 * scale) as i32;
+        let pad = (14.0 * scale) as i32;
+        let title_h = (30.0 * scale) as i32;
+        let header_area_h = pad + title_h + (4.0 * scale) as i32;
 
-        let dev_section_h = sec_h + (devices.len().max(1) as i32 * dev_row_h) + (8.0 * scale) as i32;
+        let sec_h = (26.0 * scale) as i32;
+        let dev_row_h = (58.0 * scale) as i32;
+        let app_card_h = (94.0 * scale) as i32;
+
+        let dev_section_h = sec_h + (devices.len().max(1) as i32 * dev_row_h) + (10.0 * scale) as i32;
         let app_section_h = if apps.is_empty() {
-            sec_h + (52.0 * scale) as i32
+            sec_h + (56.0 * scale) as i32
         } else {
-            sec_h + (apps.len() as i32 * (app_card_h + pad / 3)) + pad
+            sec_h + (apps.len() as i32 * (app_card_h + (8.0 * scale) as i32)) + pad
         };
 
-        let calculated_height = title_h + pad * 2 + dev_section_h + app_section_h + (12.0 * scale) as i32;
-        let total_height = calculated_height.min((680.0 * scale) as i32);
+        let content_height = dev_section_h + app_section_h + (16.0 * scale) as i32;
+        let calculated_height = header_area_h + content_height + pad;
+        // Requirement 1: Max height 650px * scale
+        let max_height = (650.0 * scale) as i32;
+        let total_height = calculated_height.min(max_height);
+
+        let container_y = header_area_h;
+        let container_h = total_height - container_y - (6.0 * scale) as i32;
+        let max_scroll_y = (content_height - container_h).max(0);
 
         let (final_x, final_y) = calculate_flyout_position(width, total_height, tray_rect);
         let _ = SetWindowPos(
@@ -388,16 +526,17 @@ pub fn toggle_flyout(
             windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS(0),
         );
 
-        // Fonts
+        // High-DPI Modern Typography
+        // Requirement 5: Title 16pt bold, Section 13pt bold, App Name 14pt bold, Badges & Percent 12pt
         let title_font = create_ui_font((16.0 * scale) as i32, 700);
-        let section_font = create_ui_font((12.0 * scale) as i32, 600);
-        let app_font = create_ui_font((13.0 * scale) as i32, 600);
-        let small_font = create_ui_font((11.0 * scale) as i32, 400);
+        let section_font = create_ui_font((13.0 * scale) as i32, 700);
+        let app_font = create_ui_font((14.0 * scale) as i32, 700);
+        let small_font = create_ui_font((12.0 * scale) as i32, 500);
 
         let bg_brush = CreateSolidBrush(COLORREF(0x001E1E1E));
         let card_brush = CreateSolidBrush(COLORREF(0x002B2B2B));
 
-        // 1. Header Title: AUDIO ROUTER v3.0.0
+        // 1. Header Title: AUDIO ROUTER v3.0.0 (fixed on top of flyout window)
         let title_ctrl = CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
             w!("STATIC"),
@@ -416,49 +555,112 @@ pub fn toggle_flyout(
             let _ = SendMessageW(th, WM_SETFONT, WPARAM(title_font.0 as usize), LPARAM(1));
         }
 
-        let mut cur_y = pad + title_h + (4.0 * scale) as i32;
+        // 2. Child container window holding the scrollable content
+        let container_style = if max_scroll_y > 0 {
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS | WS_VSCROLL
+        } else {
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS
+        };
 
-        // 2. SECTION 1: ĐA THIẾT BỊ ĐẦU RA (MULTI-OUTPUT SELECTION)
+        let container_ctrl = CreateWindowExW(
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+            container_class,
+            w!("ScrollContainer"),
+            container_style,
+            0,
+            container_y,
+            width,
+            container_h,
+            hwnd,
+            HMENU(999 as _),
+            instance,
+            None,
+        );
+
+        let container_hwnd = match container_ctrl {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = DestroyWindow(hwnd);
+                return;
+            }
+        };
+
+        if max_scroll_y > 0 {
+            let si = SCROLLINFO {
+                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+                nMin: 0,
+                nMax: content_height,
+                nPage: container_h as u32,
+                nPos: 0,
+                ..Default::default()
+            };
+            let _ = SetScrollInfo(container_hwnd, SB_VERT, &si, BOOL(1));
+        }
+
+        let mut scroll_children = Vec::new();
+        let mut cur_y = 0;
+
+        // SECTION 1: ĐA THIẾT BỊ ĐẦU RA (MULTI-OUTPUT SELECTION)
+        let sec1_x = pad;
+        let sec1_w = width - pad * 2;
         let sec1_ctrl = CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
             w!("STATIC"),
             w!("ĐA THIẾT BỊ ĐẦU RA (PHÁT ĐỒNG THỜI)"),
             WS_CHILD | WS_VISIBLE | SS_LEFT,
-            pad,
+            sec1_x,
             cur_y,
-            width - pad * 2,
+            sec1_w,
             sec_h,
-            hwnd,
+            container_hwnd,
             HMENU(500 as _),
             instance,
             None,
         );
         if let Ok(sh) = sec1_ctrl {
             let _ = SendMessageW(sh, WM_SETFONT, WPARAM(section_font.0 as usize), LPARAM(1));
+            scroll_children.push(ChildLayout {
+                hwnd: sh,
+                x: sec1_x,
+                base_y: cur_y,
+                w: sec1_w,
+                h: sec_h,
+            });
         }
-        cur_y += sec_h + (2.0 * scale) as i32;
+        cur_y += sec_h + (4.0 * scale) as i32;
 
         let mut device_bindings = Vec::new();
 
         if devices.is_empty() {
+            let no_dev_x = pad + (4.0 * scale) as i32;
+            let no_dev_w = width - pad * 2;
+            let no_dev_h = (26.0 * scale) as i32;
             let no_dev_ctrl = CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
                 w!("Không tìm thấy thiết bị âm thanh đầu ra khả dụng."),
                 WS_CHILD | WS_VISIBLE | SS_LEFT,
-                pad + (8.0 * scale) as i32,
+                no_dev_x,
                 cur_y,
-                width - pad * 2,
-                (24.0 * scale) as i32,
-                hwnd,
+                no_dev_w,
+                no_dev_h,
+                container_hwnd,
                 HMENU::default(),
                 instance,
                 None,
             );
             if let Ok(nh) = no_dev_ctrl {
                 let _ = SendMessageW(nh, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
+                scroll_children.push(ChildLayout {
+                    hwnd: nh,
+                    x: no_dev_x,
+                    base_y: cur_y,
+                    w: no_dev_w,
+                    h: no_dev_h,
+                });
             }
-            cur_y += (28.0 * scale) as i32;
+            cur_y += (30.0 * scale) as i32;
         } else {
             for (i, dev) in devices.iter().enumerate() {
                 let row_y = cur_y;
@@ -466,18 +668,18 @@ pub fn toggle_flyout(
                 let content_w = width - pad * 2;
 
                 // Line 1: Checkbox + Device Name
-                let chk_w = content_w - (140.0 * scale) as i32;
+                let chk_w = content_w - (150.0 * scale) as i32;
                 let dev_name_wide: Vec<u16> = dev.name.encode_utf16().chain(std::iter::once(0)).collect();
                 let chk_ctrl = CreateWindowExW(
                     windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
                     w!("BUTTON"),
                     PCWSTR(dev_name_wide.as_ptr()),
                     WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                    pad + (4.0 * scale) as i32,
+                    pad + (2.0 * scale) as i32,
                     row_y,
                     chk_w,
-                    (22.0 * scale) as i32,
-                    hwnd,
+                    (24.0 * scale) as i32,
+                    container_hwnd,
                     HMENU(base_id as _),
                     instance,
                     None,
@@ -486,10 +688,17 @@ pub fn toggle_flyout(
                 let _ = SendMessageW(chk_hwnd, WM_SETFONT, WPARAM(app_font.0 as usize), LPARAM(1));
                 let chk_val = if dev.is_enabled { BST_CHECKED as isize } else { BST_UNCHECKED as isize };
                 let _ = SendMessageW(chk_hwnd, BM_SETCHECK, WPARAM(chk_val as usize), LPARAM(0));
+                scroll_children.push(ChildLayout {
+                    hwnd: chk_hwnd,
+                    x: pad + (2.0 * scale) as i32,
+                    base_y: row_y,
+                    w: chk_w,
+                    h: (24.0 * scale) as i32,
+                });
 
                 // Line 1 Right: Badge [Chính] / [Đang phát] / [Tắt] + Latency/Drift
-                let badge_x = pad + (4.0 * scale) as i32 + chk_w;
-                let badge_w = (136.0 * scale) as i32;
+                let badge_x = pad + (2.0 * scale) as i32 + chk_w;
+                let badge_w = (148.0 * scale) as i32;
                 let badge_str = if dev.is_enabled {
                     if dev.is_default {
                         "[Chính • 0.0 ms]".to_string()
@@ -510,42 +719,55 @@ pub fn toggle_flyout(
                     badge_x,
                     row_y + 2,
                     badge_w,
-                    (20.0 * scale) as i32,
-                    hwnd,
+                    (22.0 * scale) as i32,
+                    container_hwnd,
                     HMENU((base_id + 1) as _),
                     instance,
                     None,
                 );
                 let badge_hwnd = badge_ctrl.unwrap_or_default();
                 let _ = SendMessageW(badge_hwnd, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
+                scroll_children.push(ChildLayout {
+                    hwnd: badge_hwnd,
+                    x: badge_x,
+                    base_y: row_y + 2,
+                    w: badge_w,
+                    h: (22.0 * scale) as i32,
+                });
 
-                // Line 2: Mute Button + Trackbar Slider + Percent Label
-                let line2_y = row_y + (24.0 * scale) as i32;
-                let btn_w = (48.0 * scale) as i32;
-                let pct_w = (38.0 * scale) as i32;
+                // Line 2: Owner-drawn Modern Mute Button + Trackbar Slider + Percent Label
+                let line2_y = row_y + (28.0 * scale) as i32;
+                let btn_w = (62.0 * scale) as i32;
+                let pct_w = (42.0 * scale) as i32;
                 let slider_w = content_w - btn_w - pct_w - (16.0 * scale) as i32;
 
-                // Mute button
-                let mute_text = if dev.is_muted { w!("Bật") } else { w!("Tắt") };
+                // OwnerDraw Mute button
                 let mute_ctrl = CreateWindowExW(
                     windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
                     w!("BUTTON"),
-                    mute_text,
-                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-                    pad + (12.0 * scale) as i32,
+                    PCWSTR::null(),
+                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
+                    pad + (6.0 * scale) as i32,
                     line2_y,
                     btn_w,
-                    (22.0 * scale) as i32,
-                    hwnd,
+                    (24.0 * scale) as i32,
+                    container_hwnd,
                     HMENU((base_id + 2) as _),
                     instance,
                     None,
                 );
                 let mute_hwnd = mute_ctrl.unwrap_or_default();
                 let _ = SendMessageW(mute_hwnd, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
+                scroll_children.push(ChildLayout {
+                    hwnd: mute_hwnd,
+                    x: pad + (6.0 * scale) as i32,
+                    base_y: line2_y,
+                    w: btn_w,
+                    h: (24.0 * scale) as i32,
+                });
 
                 // Trackbar slider
-                let slider_x = pad + (12.0 * scale) as i32 + btn_w + (6.0 * scale) as i32;
+                let slider_x = pad + (6.0 * scale) as i32 + btn_w + (6.0 * scale) as i32;
                 let slider_ctrl = CreateWindowExW(
                     windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
                     w!("msctls_trackbar32"),
@@ -554,8 +776,8 @@ pub fn toggle_flyout(
                     slider_x,
                     line2_y,
                     slider_w,
-                    (22.0 * scale) as i32,
-                    hwnd,
+                    (24.0 * scale) as i32,
+                    container_hwnd,
                     HMENU((base_id + 3) as _),
                     instance,
                     None,
@@ -569,6 +791,16 @@ pub fn toggle_flyout(
                 );
                 let vol_val = (dev.volume * 100.0).clamp(0.0, 100.0) as u32;
                 let _ = SendMessageW(slider_hwnd, TBM_SETPOS, WPARAM(1), LPARAM(vol_val as isize));
+                // Requirement 2: Subclass trackbar to prevent 20% mousewheel jump and forward to container scroll
+                let _ = SetWindowSubclass(slider_hwnd, Some(no_wheel_subclass), (base_id + 3) as usize, 0);
+
+                scroll_children.push(ChildLayout {
+                    hwnd: slider_hwnd,
+                    x: slider_x,
+                    base_y: line2_y,
+                    w: slider_w,
+                    h: (24.0 * scale) as i32,
+                });
 
                 // Percent label
                 let pct_x = slider_x + slider_w + (4.0 * scale) as i32;
@@ -582,14 +814,21 @@ pub fn toggle_flyout(
                     pct_x,
                     line2_y + 2,
                     pct_w,
-                    (20.0 * scale) as i32,
-                    hwnd,
+                    (22.0 * scale) as i32,
+                    container_hwnd,
                     HMENU((base_id + 4) as _),
                     instance,
                     None,
                 );
                 let percent_hwnd = pct_ctrl.unwrap_or_default();
                 let _ = SendMessageW(percent_hwnd, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
+                scroll_children.push(ChildLayout {
+                    hwnd: percent_hwnd,
+                    x: pct_x,
+                    base_y: line2_y + 2,
+                    w: pct_w,
+                    h: (22.0 * scale) as i32,
+                });
 
                 device_bindings.push(DeviceControlBinding {
                     device_index: i,
@@ -604,47 +843,66 @@ pub fn toggle_flyout(
             }
         }
 
-        cur_y += (6.0 * scale) as i32;
+        cur_y += (8.0 * scale) as i32;
 
-        // 3. SECTION 2: DANH SÁCH ỨNG DỤNG ĐANG PHÁT (ACTIVE SESSIONS)
+        // SECTION 2: DANH SÁCH ỨNG DỤNG ĐANG PHÁT (ACTIVE SESSIONS)
+        let sec2_x = pad;
+        let sec2_w = width - pad * 2;
         let sec2_ctrl = CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
             w!("STATIC"),
             w!("ÂM LƯỢNG & ĐỊNH TUYẾN TỪNG ỨNG DỤNG (ACTIVE SESSIONS)"),
             WS_CHILD | WS_VISIBLE | SS_LEFT,
-            pad,
+            sec2_x,
             cur_y,
-            width - pad * 2,
+            sec2_w,
             sec_h,
-            hwnd,
+            container_hwnd,
             HMENU(501 as _),
             instance,
             None,
         );
         if let Ok(sh) = sec2_ctrl {
             let _ = SendMessageW(sh, WM_SETFONT, WPARAM(section_font.0 as usize), LPARAM(1));
+            scroll_children.push(ChildLayout {
+                hwnd: sh,
+                x: sec2_x,
+                base_y: cur_y,
+                w: sec2_w,
+                h: sec_h,
+            });
         }
         cur_y += sec_h + (4.0 * scale) as i32;
 
         let mut app_bindings = Vec::new();
 
         if apps.is_empty() {
+            let empty_x = pad;
+            let empty_w = width - pad * 2;
+            let empty_h = (46.0 * scale) as i32;
             let empty_ctrl = CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
                 w!("Chưa có ứng dụng nào phát âm thanh.\nHãy mở nhạc, video hoặc game rồi bấm lại icon."),
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
-                pad,
-                cur_y + (8.0 * scale) as i32,
-                width - pad * 2,
-                (42.0 * scale) as i32,
-                hwnd,
+                empty_x,
+                cur_y + (6.0 * scale) as i32,
+                empty_w,
+                empty_h,
+                container_hwnd,
                 HMENU::default(),
                 instance,
                 None,
             );
             if let Ok(eh) = empty_ctrl {
                 let _ = SendMessageW(eh, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
+                scroll_children.push(ChildLayout {
+                    hwnd: eh,
+                    x: empty_x,
+                    base_y: cur_y + (6.0 * scale) as i32,
+                    w: empty_w,
+                    h: empty_h,
+                });
             }
         } else {
             for (i, app) in apps.iter().enumerate() {
@@ -654,7 +912,7 @@ pub fn toggle_flyout(
 
                 // App icon
                 let icon = load_app_icon(app.exe_path.as_deref());
-                let icon_size = (24.0 * scale) as i32;
+                let icon_size = (26.0 * scale) as i32;
 
                 if let Some(hicon) = icon {
                     let icon_ctrl = CreateWindowExW(
@@ -666,17 +924,24 @@ pub fn toggle_flyout(
                         card_y + 4,
                         icon_size,
                         icon_size,
-                        hwnd,
+                        container_hwnd,
                         HMENU(base_id as _),
                         instance,
                         None,
                     );
                     if let Ok(ih) = icon_ctrl {
                         let _ = SendMessageW(ih, STM_SETICON, WPARAM(hicon.0 as usize), LPARAM(0));
+                        scroll_children.push(ChildLayout {
+                            hwnd: ih,
+                            x: pad + 4,
+                            base_y: card_y + 4,
+                            w: icon_size,
+                            h: icon_size,
+                        });
                     }
                 }
 
-                // App Name Label
+                // App Name Label (14pt bold)
                 let name_x = pad + icon_size + (8.0 * scale) as i32;
                 let name_w = card_w - (icon_size + (8.0 * scale) as i32) - 4;
                 let name_display = format!("{} (PID: {})", app.name, app.pid);
@@ -689,19 +954,25 @@ pub fn toggle_flyout(
                     name_x,
                     card_y + 4,
                     name_w,
-                    (20.0 * scale) as i32,
-                    hwnd,
+                    (24.0 * scale) as i32,
+                    container_hwnd,
                     HMENU((base_id + 1) as _),
                     instance,
                     None,
                 );
-                if let Ok(nh) = name_ctrl {
-                    let _ = SendMessageW(nh, WM_SETFONT, WPARAM(app_font.0 as usize), LPARAM(1));
-                }
+                let name_hwnd = name_ctrl.unwrap_or_default();
+                let _ = SendMessageW(name_hwnd, WM_SETFONT, WPARAM(app_font.0 as usize), LPARAM(1));
+                scroll_children.push(ChildLayout {
+                    hwnd: name_hwnd,
+                    x: name_x,
+                    base_y: card_y + 4,
+                    w: name_w,
+                    h: (24.0 * scale) as i32,
+                });
 
-                // ComboBox: Route selection ("Phát Đa Đầu Ra" or pin to specific device)
-                let combo_y = card_y + (26.0 * scale) as i32;
-                let combo_h = (26.0 * scale) as i32;
+                // ComboBox: Route selection ("Phát Đa Đầu Ra" or direct device name without "Ghim: ")
+                let combo_y = card_y + (30.0 * scale) as i32;
+                let combo_h = (28.0 * scale) as i32;
                 let combo_ctrl = CreateWindowExW(
                     windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
                     w!("COMBOBOX"),
@@ -711,13 +982,23 @@ pub fn toggle_flyout(
                     combo_y,
                     card_w - 8,
                     (220.0 * scale) as i32,
-                    hwnd,
+                    container_hwnd,
                     HMENU((base_id + 2) as _),
                     instance,
                     None,
                 );
                 let combo_hwnd = combo_ctrl.unwrap_or_default();
                 let _ = SendMessageW(combo_hwnd, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
+                // Requirement 3: Subclass ComboBox to prevent accidental mousewheel selection change
+                let _ = SetWindowSubclass(combo_hwnd, Some(no_wheel_subclass), (base_id + 2) as usize, 0);
+
+                scroll_children.push(ChildLayout {
+                    hwnd: combo_hwnd,
+                    x: pad + 4,
+                    base_y: combo_y,
+                    w: card_w - 8,
+                    h: combo_h,
+                });
 
                 // Populate ComboBox options
                 // Item 0: Multi-Output mode
@@ -728,8 +1009,9 @@ pub fn toggle_flyout(
                 let is_explicit_multi = app.current_device_id == "multi"
                     || config.get_app_rule(&app.name).map_or(false, |r| r == "multi");
 
+                // Requirement 4: Direct device name without "Ghim: " prefix!
                 for (dev_idx, dev) in devices.iter().enumerate() {
-                    let opt_name = format!("Ghim: {}", dev.name);
+                    let opt_name = dev.name.clone();
                     let opt_wide: Vec<u16> = opt_name.encode_utf16().chain(std::iter::once(0)).collect();
                     let _ = SendMessageW(
                         combo_hwnd,
@@ -744,30 +1026,36 @@ pub fn toggle_flyout(
                 }
                 let _ = SendMessageW(combo_hwnd, CB_SETCURSEL, WPARAM(selected_idx), LPARAM(0));
 
-                // Row 3: Mute button, Slider trackbar, Volume percent
-                let row3_y = combo_y + combo_h + (4.0 * scale) as i32;
-                let btn_w = (48.0 * scale) as i32;
-                let pct_w = (38.0 * scale) as i32;
+                // Row 3: Owner-drawn Modern Mute button, Slider trackbar, Volume percent
+                let row3_y = combo_y + combo_h + (6.0 * scale) as i32;
+                let btn_w = (62.0 * scale) as i32;
+                let pct_w = (42.0 * scale) as i32;
                 let slider_w = card_w - btn_w - pct_w - (16.0 * scale) as i32;
 
-                // Mute button
-                let mute_text = if app.is_muted { w!("Bật") } else { w!("Tắt") };
+                // OwnerDraw Mute button
                 let mute_ctrl = CreateWindowExW(
                     windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
                     w!("BUTTON"),
-                    mute_text,
-                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+                    PCWSTR::null(),
+                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
                     pad + 4,
                     row3_y,
                     btn_w,
-                    (22.0 * scale) as i32,
-                    hwnd,
+                    (24.0 * scale) as i32,
+                    container_hwnd,
                     HMENU((base_id + 3) as _),
                     instance,
                     None,
                 );
                 let mute_hwnd = mute_ctrl.unwrap_or_default();
                 let _ = SendMessageW(mute_hwnd, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
+                scroll_children.push(ChildLayout {
+                    hwnd: mute_hwnd,
+                    x: pad + 4,
+                    base_y: row3_y,
+                    w: btn_w,
+                    h: (24.0 * scale) as i32,
+                });
 
                 // Slider trackbar
                 let slider_x = pad + 4 + btn_w + (4.0 * scale) as i32;
@@ -779,8 +1067,8 @@ pub fn toggle_flyout(
                     slider_x,
                     row3_y,
                     slider_w,
-                    (22.0 * scale) as i32,
-                    hwnd,
+                    (24.0 * scale) as i32,
+                    container_hwnd,
                     HMENU((base_id + 4) as _),
                     instance,
                     None,
@@ -794,6 +1082,16 @@ pub fn toggle_flyout(
                 );
                 let vol_val = (app.volume * 100.0).clamp(0.0, 100.0) as u32;
                 let _ = SendMessageW(slider_hwnd, TBM_SETPOS, WPARAM(1), LPARAM(vol_val as isize));
+                // Requirement 2: Subclass trackbar
+                let _ = SetWindowSubclass(slider_hwnd, Some(no_wheel_subclass), (base_id + 4) as usize, 0);
+
+                scroll_children.push(ChildLayout {
+                    hwnd: slider_hwnd,
+                    x: slider_x,
+                    base_y: row3_y,
+                    w: slider_w,
+                    h: (24.0 * scale) as i32,
+                });
 
                 // Percent label
                 let pct_x = slider_x + slider_w + (4.0 * scale) as i32;
@@ -807,14 +1105,21 @@ pub fn toggle_flyout(
                     pct_x,
                     row3_y + 2,
                     pct_w,
-                    (20.0 * scale) as i32,
-                    hwnd,
+                    (22.0 * scale) as i32,
+                    container_hwnd,
                     HMENU((base_id + 5) as _),
                     instance,
                     None,
                 );
                 let percent_hwnd = pct_ctrl.unwrap_or_default();
                 let _ = SendMessageW(percent_hwnd, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
+                scroll_children.push(ChildLayout {
+                    hwnd: percent_hwnd,
+                    x: pct_x,
+                    base_y: row3_y + 2,
+                    w: pct_w,
+                    h: (22.0 * scale) as i32,
+                });
 
                 app_bindings.push(AppControlBinding {
                     app_index: i,
@@ -825,7 +1130,7 @@ pub fn toggle_flyout(
                     icon,
                 });
 
-                cur_y += app_card_h + (pad / 3);
+                cur_y += app_card_h + (8.0 * scale) as i32;
             }
         }
 
@@ -834,6 +1139,12 @@ pub fn toggle_flyout(
 
         let state = Box::new(FlyoutState {
             owner_hwnd,
+            container_hwnd,
+            scale,
+            scroll_y: 0,
+            max_scroll_y,
+            container_h,
+            scroll_children,
             devices,
             apps,
             bg_brush,
@@ -897,6 +1208,138 @@ unsafe extern "system" fn flyout_wndproc(
             if wparam.0 == VK_ESCAPE.0 as usize {
                 close_flyout();
                 return LRESULT(0);
+            }
+        }
+
+        WM_MOUSEWHEEL => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                if state.max_scroll_y > 0 {
+                    let delta = ((wparam.0 as i32) >> 16) as i16 as i32;
+                    let notches = delta / 120;
+                    let step = if notches != 0 {
+                        notches * (50.0 * state.scale) as i32
+                    } else {
+                        (delta * (50.0 * state.scale) as i32) / 120
+                    };
+                    let new_scroll_y = (state.scroll_y - step).clamp(0, state.max_scroll_y);
+                    if new_scroll_y != state.scroll_y {
+                        state.scroll_y = new_scroll_y;
+                        state.apply_scroll();
+                    }
+                    return LRESULT(0);
+                }
+            }
+        }
+
+        WM_VSCROLL => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                if state.max_scroll_y > 0 {
+                    let action = (wparam.0 as u32) & 0xFFFF;
+                    let old_pos = state.scroll_y;
+                    let line_step = (30.0 * state.scale) as i32;
+                    let page_step = state.container_h;
+                    let new_pos = match action {
+                        x if x == SB_LINEUP.0 as u32 => (old_pos - line_step).max(0),
+                        x if x == SB_LINEDOWN.0 as u32 => (old_pos + line_step).min(state.max_scroll_y),
+                        x if x == SB_PAGEUP.0 as u32 => (old_pos - page_step).max(0),
+                        x if x == SB_PAGEDOWN.0 as u32 => (old_pos + page_step).min(state.max_scroll_y),
+                        x if x == SB_THUMBTRACK.0 as u32 || x == SB_THUMBPOSITION.0 as u32 => {
+                            let mut si = SCROLLINFO {
+                                cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                                fMask: SIF_ALL,
+                                ..Default::default()
+                            };
+                            let _ = GetScrollInfo(state.container_hwnd, SB_VERT, &mut si);
+                            si.nTrackPos.clamp(0, state.max_scroll_y)
+                        }
+                        _ => old_pos,
+                    };
+                    if new_pos != old_pos {
+                        state.scroll_y = new_pos;
+                        state.apply_scroll();
+                    }
+                    return LRESULT(0);
+                }
+            }
+        }
+
+        WM_DRAWITEM => {
+            if !state_ptr.is_null() {
+                let state = &*state_ptr;
+                let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
+                let btn_hwnd = dis.hwndItem;
+
+                // Determine if this is a Device Mute button or App Mute button and its muted state
+                let mut is_muted = false;
+                for b in &state.device_bindings {
+                    if b.mute_hwnd == btn_hwnd {
+                        is_muted = state.devices[b.device_index].is_muted;
+                        break;
+                    }
+                }
+                for b in &state.app_bindings {
+                    if b.mute_hwnd == btn_hwnd {
+                        is_muted = state.apps[b.app_index].is_muted;
+                        break;
+                    }
+                }
+
+                let is_selected = (dis.itemState.0 & ODS_SELECTED.0) != 0;
+
+                // Requirement 5: Modern owner-drawn buttons
+                // - Active (unmuted): Dark gray #383838, border #4A4A4A, white text "Bật"
+                // - Muted: Warm dark red #5A1E1E (border #8A2E2E), soft red text #FF9999 "Đã tắt"
+                // Note: Windows COLORREF is 0x00BBGGRR
+                let (bg_col, border_col, text_col, btn_text) = if is_muted {
+                    let bg = if is_selected { COLORREF(0x0024246E) } else { COLORREF(0x001E1E5A) };
+                    let border = COLORREF(0x002E2E8A);
+                    let text = COLORREF(0x009999FF);
+                    (bg, border, text, "Đã tắt")
+                } else {
+                    let bg = if is_selected { COLORREF(0x00484848) } else { COLORREF(0x00383838) };
+                    let border = COLORREF(0x004E4E4E);
+                    let text = COLORREF(0x00FFFFFF);
+                    (bg, border, text, "Bật")
+                };
+
+                let pen = CreatePen(PS_SOLID, 1, border_col);
+                let brush = CreateSolidBrush(bg_col);
+                let old_pen = SelectObject(dis.hDC, pen);
+                let old_brush = SelectObject(dis.hDC, brush);
+
+                let corner = (6.0 * state.scale) as i32;
+                let _ = RoundRect(
+                    dis.hDC,
+                    dis.rcItem.left,
+                    dis.rcItem.top,
+                    dis.rcItem.right,
+                    dis.rcItem.bottom,
+                    corner,
+                    corner,
+                );
+
+                let _ = SelectObject(dis.hDC, old_pen);
+                let _ = SelectObject(dis.hDC, old_brush);
+                let _ = DeleteObject(pen);
+                let _ = DeleteObject(brush);
+
+                let _ = SetBkMode(dis.hDC, TRANSPARENT);
+                let _ = SetTextColor(dis.hDC, text_col);
+                let old_font = SelectObject(dis.hDC, state.small_font);
+
+                let mut wide_text: Vec<u16> = btn_text.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut rc = dis.rcItem;
+                let _ = DrawTextW(
+                    dis.hDC,
+                    &mut wide_text[..btn_text.encode_utf16().count()],
+                    &mut rc,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+
+                let _ = SelectObject(dis.hDC, old_font);
+                return LRESULT(1);
             }
         }
 
@@ -1020,8 +1463,7 @@ unsafe extern "system" fn flyout_wndproc(
                         if b.mute_hwnd.0 as isize == lparam.0 {
                             let dev = &mut state.devices[b.device_index];
                             dev.is_muted = !dev.is_muted;
-                            let new_text = if dev.is_muted { w!("Bật") } else { w!("Tắt") };
-                            let _ = SetWindowTextW(b.mute_hwnd, new_text);
+                            let _ = InvalidateRect(b.mute_hwnd, None, BOOL(1));
 
                             // Apply hardware endpoint mute
                             let _ = crate::audio::set_device_endpoint_mute(&dev.id, dev.is_muted);
@@ -1039,8 +1481,7 @@ unsafe extern "system" fn flyout_wndproc(
                         if b.mute_hwnd.0 as isize == lparam.0 {
                             let app = &mut state.apps[b.app_index];
                             app.is_muted = !app.is_muted;
-                            let new_text = if app.is_muted { w!("Bật") } else { w!("Tắt") };
-                            let _ = SetWindowTextW(b.mute_hwnd, new_text);
+                            let _ = InvalidateRect(b.mute_hwnd, None, BOOL(1));
 
                             // Set mute in Windows Core Audio
                             let _ = crate::audio::set_app_mute(app.pid, &app.current_device_id, app.is_muted);
@@ -1212,7 +1653,7 @@ mod tests {
 
     #[test]
     fn test_calculate_flyout_pos() {
-        let (x, y) = calculate_flyout_position(420, 300, None);
+        let (x, y) = calculate_flyout_position(480, 300, None);
         assert!(x >= 0);
         assert!(y >= 0);
 
@@ -1222,7 +1663,7 @@ mod tests {
             right: 1740,
             bottom: 1080,
         };
-        let (x2, y2) = calculate_flyout_position(420, 300, Some(dummy_rect));
+        let (x2, y2) = calculate_flyout_position(480, 300, Some(dummy_rect));
         assert!(x2 > 0);
         assert!(y2 > 0);
     }
