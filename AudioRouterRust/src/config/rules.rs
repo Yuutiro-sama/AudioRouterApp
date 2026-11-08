@@ -3,6 +3,37 @@ use std::collections::BTreeMap;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 
+fn default_volume() -> f32 {
+    1.0
+}
+
+/// Version 3 per-application routing & volume rule
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct AppRuleV3 {
+    #[serde(default)]
+    pub primary_device: String,
+    #[serde(default)]
+    pub secondary_device: String,
+    #[serde(default)]
+    pub secondary_enabled: bool,
+    #[serde(default = "default_volume")]
+    pub volume: f32,
+    #[serde(default)]
+    pub muted: bool,
+}
+
+impl Default for AppRuleV3 {
+    fn default() -> Self {
+        Self {
+            primary_device: String::new(),
+            secondary_device: String::new(),
+            secondary_enabled: false,
+            volume: 1.0,
+            muted: false,
+        }
+    }
+}
+
 /// Application route rule configuration (legacy compatibility)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AppRouteRule {
@@ -107,13 +138,22 @@ pub struct ConfigV3 {
     /// Trạng thái tắt tiếng từng thiết bị (true = tắt tiếng)
     #[serde(default)]
     pub device_mutes: BTreeMap<String, bool>,
-    /// Quy tắc định tuyến ghim cứng của từng app hoặc "multi"
+    /// Cấu hình quy tắc của từng ứng dụng v3 (Primary, Secondary, Volume, Mute)
+    #[serde(default)]
+    pub apps: BTreeMap<String, AppRuleV3>,
+    /// Quy tắc định tuyến ghim cứng của từng app hoặc "multi" (legacy compatibility)
     #[serde(default)]
     pub app_rules: BTreeMap<String, String>,
-    /// Âm lượng lưu của từng app (0.0 .. 1.0)
+    /// Quy tắc thiết bị đầu ra phụ (secondary device) của từng app (legacy compatibility)
+    #[serde(default)]
+    pub app_secondary_rules: BTreeMap<String, String>,
+    /// Trạng thái bật/tắt thiết bị đầu ra phụ của từng app (legacy compatibility)
+    #[serde(default)]
+    pub app_secondary_enabled: BTreeMap<String, bool>,
+    /// Âm lượng lưu của từng app (0.0 .. 1.0) (legacy compatibility)
     #[serde(default)]
     pub app_volumes: BTreeMap<String, f32>,
-    /// Trạng thái mute của từng app (true = tắt tiếng)
+    /// Trạng thái mute của từng app (true = tắt tiếng) (legacy compatibility)
     #[serde(default)]
     pub app_mutes: BTreeMap<String, bool>,
 }
@@ -172,8 +212,59 @@ impl ConfigV3 {
         self.device_mutes.insert(device_id, muted);
     }
 
-    /// Tra cứu quy tắc định tuyến của app (case-insensitive & .exe tolerant)
-    pub fn get_app_rule(&self, app_name: &str) -> Option<&String> {
+    /// Tra cứu quy tắc định tuyến của app (case-insensitive & .exe tolerant).
+    /// Ưu tiên tìm trong `apps`, nếu không có sẽ fallback về các trường legacy (`app_rules`, `app_secondary_rules`, `app_volumes`, `app_mutes`).
+    pub fn get_app_rule(&self, app_name: &str) -> AppRuleV3 {
+        let norm = normalize_app_key(app_name);
+        if let Some(rule) = self.apps.get(&norm) {
+            return rule.clone();
+        }
+        let name_lower = app_name.to_lowercase();
+        if let Some(rule) = self.apps.get(&name_lower) {
+            return rule.clone();
+        }
+        let name_no_ext = name_lower.strip_suffix(".exe").unwrap_or(&name_lower);
+        for (k, v) in &self.apps {
+            let k_lower = k.to_lowercase();
+            let k_no_ext = k_lower.strip_suffix(".exe").unwrap_or(&k_lower);
+            if k_no_ext == name_no_ext {
+                return v.clone();
+            }
+        }
+
+        // Fallback kiểm tra các trường legacy
+        let legacy_target = self.get_legacy_app_rule(app_name).cloned().unwrap_or_default();
+        let sec_target = self.get_legacy_secondary_device(app_name).cloned().unwrap_or_default();
+        let sec_enabled = self.is_legacy_secondary_enabled(app_name);
+
+        let has_vol = self.app_volumes.contains_key(&norm)
+            || self.app_volumes.contains_key(&name_lower)
+            || self.app_volumes.iter().any(|(k, _)| {
+                let kl = k.to_lowercase();
+                kl.strip_suffix(".exe").unwrap_or(&kl) == name_no_ext
+            });
+        let has_mute = self.app_mutes.contains_key(&norm)
+            || self.app_mutes.contains_key(&name_lower)
+            || self.app_mutes.iter().any(|(k, _)| {
+                let kl = k.to_lowercase();
+                kl.strip_suffix(".exe").unwrap_or(&kl) == name_no_ext
+            });
+
+        if !legacy_target.is_empty() || !sec_target.is_empty() || sec_enabled || has_vol || has_mute {
+            return AppRuleV3 {
+                primary_device: legacy_target,
+                secondary_device: sec_target,
+                secondary_enabled: sec_enabled,
+                volume: self.get_app_volume(app_name),
+                muted: self.is_app_muted(app_name),
+            };
+        }
+
+        AppRuleV3::default()
+    }
+
+    /// Tra cứu quy tắc legacy dạng chuỗi target device_id hoặc "multi"
+    pub fn get_legacy_app_rule(&self, app_name: &str) -> Option<&String> {
         let norm = normalize_app_key(app_name);
         if let Some(val) = self.app_rules.get(&norm) {
             return Some(val);
@@ -193,29 +284,143 @@ impl ConfigV3 {
         None
     }
 
-    /// Lưu quy tắc định tuyến cho ứng dụng
+    /// Tra cứu thiết bị đầu ra phụ dạng legacy (case-insensitive & .exe tolerant)
+    pub fn get_legacy_secondary_device(&self, app_name: &str) -> Option<&String> {
+        let norm = normalize_app_key(app_name);
+        if let Some(val) = self.app_secondary_rules.get(&norm) {
+            return Some(val);
+        }
+        let name_lower = app_name.to_lowercase();
+        if let Some(val) = self.app_secondary_rules.get(&name_lower) {
+            return Some(val);
+        }
+        let name_no_ext = name_lower.strip_suffix(".exe").unwrap_or(&name_lower);
+        for (k, v) in &self.app_secondary_rules {
+            let k_lower = k.to_lowercase();
+            let k_no_ext = k_lower.strip_suffix(".exe").unwrap_or(&k_lower);
+            if k_no_ext == name_no_ext {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// Kiểm tra trạng thái bật/tắt thiết bị đầu ra phụ dạng legacy (mặc định false)
+    pub fn is_legacy_secondary_enabled(&self, app_name: &str) -> bool {
+        let norm = normalize_app_key(app_name);
+        if let Some(&en) = self.app_secondary_enabled.get(&norm) {
+            return en;
+        }
+        let name_lower = app_name.to_lowercase();
+        if let Some(&en) = self.app_secondary_enabled.get(&name_lower) {
+            return en;
+        }
+        let name_no_ext = name_lower.strip_suffix(".exe").unwrap_or(&name_lower);
+        for (k, v) in &self.app_secondary_enabled {
+            let k_lower = k.to_lowercase();
+            let k_no_ext = k_lower.strip_suffix(".exe").unwrap_or(&k_lower);
+            if k_no_ext == name_no_ext {
+                return *v;
+            }
+        }
+        false
+    }
+
+    /// Tra cứu thiết bị đầu ra chính của app
+    pub fn get_app_primary_device(&self, app_name: &str) -> Option<String> {
+        let rule = self.get_app_rule(app_name);
+        if !rule.primary_device.is_empty() {
+            Some(rule.primary_device)
+        } else {
+            None
+        }
+    }
+
+    /// Thiết lập thiết bị phát chính (Primary Device) cho ứng dụng
+    pub fn set_app_primary_device(&mut self, app_name: String, dev_id: String) {
+        let key = normalize_app_key(&app_name);
+        let entry = self.apps.entry(key.clone()).or_insert_with(AppRuleV3::default);
+        entry.primary_device = dev_id.clone();
+        // Đồng bộ trường legacy
+        self.app_rules.insert(key, dev_id);
+    }
+
+    /// Tra cứu thiết bị đầu ra phụ của app
+    pub fn get_app_secondary_device(&self, app_name: &str) -> Option<String> {
+        let rule = self.get_app_rule(app_name);
+        if !rule.secondary_device.is_empty() {
+            Some(rule.secondary_device)
+        } else {
+            None
+        }
+    }
+
+    /// Thiết lập thiết bị phát phụ (Secondary Device) cho ứng dụng
+    pub fn set_app_secondary_device(&mut self, app_name: String, dev_id: String) {
+        let key = normalize_app_key(&app_name);
+        let entry = self.apps.entry(key.clone()).or_insert_with(AppRuleV3::default);
+        entry.secondary_device = dev_id.clone();
+        // Đồng bộ trường legacy
+        self.app_secondary_rules.insert(key, dev_id);
+    }
+
+    /// Kiểm tra trạng thái bật/tắt thiết bị đầu ra phụ của app
+    pub fn is_app_secondary_enabled(&self, app_name: &str) -> bool {
+        self.get_app_rule(app_name).secondary_enabled
+    }
+
+    /// Bật/tắt phát đồng thời ra thiết bị phụ cho ứng dụng
+    pub fn set_app_secondary_enabled(&mut self, app_name: String, enabled: bool) {
+        let key = normalize_app_key(&app_name);
+        let entry = self.apps.entry(key.clone()).or_insert_with(AppRuleV3::default);
+        entry.secondary_enabled = enabled;
+        // Đồng bộ trường legacy
+        self.app_secondary_enabled.insert(key, enabled);
+    }
+
+    /// Lưu quy tắc định tuyến cho ứng dụng (tương thích API cũ)
     pub fn set_app_rule(&mut self, app_name: String, target: String) {
-        self.app_rules.insert(normalize_app_key(&app_name), target);
+        self.set_app_primary_device(app_name, target);
     }
 
     /// Xóa quy tắc định tuyến của ứng dụng
-    pub fn remove_app_rule(&mut self, app_name: &str) -> Option<String> {
+    pub fn remove_app_rule(&mut self, app_name: &str) -> Option<AppRuleV3> {
         let norm = normalize_app_key(app_name);
-        self.app_rules.remove(&norm)
-            .or_else(|| self.app_rules.remove(&app_name.to_lowercase()))
+        let _ = self.app_rules.remove(&norm)
+            .or_else(|| self.app_rules.remove(&app_name.to_lowercase()));
+        let _ = self.app_secondary_rules.remove(&norm)
+            .or_else(|| self.app_secondary_rules.remove(&app_name.to_lowercase()));
+        let _ = self.app_secondary_enabled.remove(&norm)
+            .or_else(|| self.app_secondary_enabled.remove(&app_name.to_lowercase()));
+        self.apps.remove(&norm)
+            .or_else(|| self.apps.remove(&app_name.to_lowercase()))
     }
 
     /// Lấy âm lượng của app (mặc định 1.0, case-insensitive & .exe tolerant)
     pub fn get_app_volume(&self, app_name: &str) -> f32 {
         let norm = normalize_app_key(app_name);
+        if let Some(rule) = self.apps.get(&norm) {
+            return rule.volume;
+        }
+        let name_lower = app_name.to_lowercase();
+        if let Some(rule) = self.apps.get(&name_lower) {
+            return rule.volume;
+        }
+        let name_no_ext = name_lower.strip_suffix(".exe").unwrap_or(&name_lower);
+        for (k, v) in &self.apps {
+            let k_lower = k.to_lowercase();
+            let k_no_ext = k_lower.strip_suffix(".exe").unwrap_or(&k_lower);
+            if k_no_ext == name_no_ext {
+                return v.volume;
+            }
+        }
+
         if let Some(&vol) = self.app_volumes.get(&norm) {
             return vol;
         }
-        let name_lower = app_name.to_lowercase();
         if let Some(&vol) = self.app_volumes.get(&name_lower) {
             return vol;
         }
-        let name_no_ext = name_lower.strip_suffix(".exe").unwrap_or(&name_lower);
         for (k, v) in &self.app_volumes {
             let k_lower = k.to_lowercase();
             let k_no_ext = k_lower.strip_suffix(".exe").unwrap_or(&k_lower);
@@ -228,20 +433,39 @@ impl ConfigV3 {
 
     /// Lưu âm lượng của app
     pub fn set_app_volume(&mut self, app_name: String, volume: f32) {
-        self.app_volumes.insert(normalize_app_key(&app_name), volume.clamp(0.0, 1.0));
+        let clamped = volume.clamp(0.0, 1.0);
+        let key = normalize_app_key(&app_name);
+        let entry = self.apps.entry(key.clone()).or_insert_with(AppRuleV3::default);
+        entry.volume = clamped;
+        // Đồng bộ trường legacy app_volumes
+        self.app_volumes.insert(key, clamped);
     }
 
     /// Kiểm tra trạng thái tắt tiếng của app (mặc định false)
     pub fn is_app_muted(&self, app_name: &str) -> bool {
         let norm = normalize_app_key(app_name);
+        if let Some(rule) = self.apps.get(&norm) {
+            return rule.muted;
+        }
+        let name_lower = app_name.to_lowercase();
+        if let Some(rule) = self.apps.get(&name_lower) {
+            return rule.muted;
+        }
+        let name_no_ext = name_lower.strip_suffix(".exe").unwrap_or(&name_lower);
+        for (k, v) in &self.apps {
+            let k_lower = k.to_lowercase();
+            let k_no_ext = k_lower.strip_suffix(".exe").unwrap_or(&k_lower);
+            if k_no_ext == name_no_ext {
+                return v.muted;
+            }
+        }
+
         if let Some(&muted) = self.app_mutes.get(&norm) {
             return muted;
         }
-        let name_lower = app_name.to_lowercase();
         if let Some(&muted) = self.app_mutes.get(&name_lower) {
             return muted;
         }
-        let name_no_ext = name_lower.strip_suffix(".exe").unwrap_or(&name_lower);
         for (k, v) in &self.app_mutes {
             let k_lower = k.to_lowercase();
             let k_no_ext = k_lower.strip_suffix(".exe").unwrap_or(&k_lower);
@@ -254,7 +478,11 @@ impl ConfigV3 {
 
     /// Lưu trạng thái tắt tiếng của app
     pub fn set_app_mute(&mut self, app_name: String, muted: bool) {
-        self.app_mutes.insert(normalize_app_key(&app_name), muted);
+        let key = normalize_app_key(&app_name);
+        let entry = self.apps.entry(key.clone()).or_insert_with(AppRuleV3::default);
+        entry.muted = muted;
+        // Đồng bộ trường legacy app_mutes
+        self.app_mutes.insert(key, muted);
     }
 }
 
@@ -303,7 +531,24 @@ pub fn load_config_v3() -> ConfigV3 {
     let path = get_config_v3_path();
     if path.exists() {
         if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Ok(cfg) = serde_json::from_str::<ConfigV3>(&contents) {
+            if let Ok(mut cfg) = serde_json::from_str::<ConfigV3>(&contents) {
+                // If apps is empty but legacy app_rules has entries, populate apps
+                if cfg.apps.is_empty() && !cfg.app_rules.is_empty() {
+                    for (k, v) in &cfg.app_rules {
+                        let norm = normalize_app_key(k);
+                        let sec_dev = cfg.app_secondary_rules.get(&norm).or_else(|| cfg.app_secondary_rules.get(k)).cloned().unwrap_or_default();
+                        let sec_en = cfg.app_secondary_enabled.get(&norm).or_else(|| cfg.app_secondary_enabled.get(k)).copied().unwrap_or(false);
+                        let vol = cfg.app_volumes.get(&norm).or_else(|| cfg.app_volumes.get(k)).copied().unwrap_or(1.0);
+                        let muted = cfg.app_mutes.get(&norm).or_else(|| cfg.app_mutes.get(k)).copied().unwrap_or(false);
+                        cfg.apps.insert(norm, AppRuleV3 {
+                            primary_device: v.clone(),
+                            secondary_device: sec_dev,
+                            secondary_enabled: sec_en,
+                            volume: vol,
+                            muted,
+                        });
+                    }
+                }
                 return cfg;
             }
         }
@@ -313,7 +558,17 @@ pub fn load_config_v3() -> ConfigV3 {
     let legacy_rules = load_rules();
     if !legacy_rules.is_empty() {
         let mut cfg = ConfigV3::default();
-        cfg.app_rules = legacy_rules;
+        for (k, v) in &legacy_rules {
+            let norm = normalize_app_key(k);
+            cfg.apps.insert(norm.clone(), AppRuleV3 {
+                primary_device: v.clone(),
+                secondary_device: String::new(),
+                secondary_enabled: false,
+                volume: 1.0,
+                muted: false,
+            });
+            cfg.app_rules.insert(norm, v.clone());
+        }
         let _ = save_config_v3(&cfg);
         return cfg;
     }
@@ -470,6 +725,16 @@ mod tests {
     }
 
     #[test]
+    fn test_app_rule_v3_default() {
+        let rule = AppRuleV3::default();
+        assert_eq!(rule.primary_device, "");
+        assert_eq!(rule.secondary_device, "");
+        assert!(!rule.secondary_enabled);
+        assert_eq!(rule.volume, 1.0);
+        assert!(!rule.muted);
+    }
+
+    #[test]
     fn test_config_v3_default_and_helpers() {
         let mut cfg = ConfigV3::init_default(Some("{0.0.0.00000000}.{speaker}"));
         assert!(cfg.is_device_enabled("{0.0.0.00000000}.{speaker}"));
@@ -482,17 +747,39 @@ mod tests {
         cfg.set_device_mute("{0.0.0.00000000}.{speaker}".into(), true);
         assert!(cfg.is_device_muted("{0.0.0.00000000}.{speaker}"));
 
-        cfg.set_app_rule("spotify.exe".into(), "multi".into());
-        assert_eq!(cfg.get_app_rule("Spotify"), Some(&"multi".to_string()));
-        assert_eq!(cfg.get_app_rule("spotify.exe"), Some(&"multi".to_string()));
-
+        cfg.set_app_primary_device("spotify.exe".into(), "multi".into());
+        cfg.set_app_secondary_device("spotify.exe".into(), "dev_2".into());
+        cfg.set_app_secondary_enabled("spotify.exe".into(), true);
         cfg.set_app_volume("spotify.exe".into(), 0.85);
+        cfg.set_app_mute("spotify.exe".into(), true);
+
+        let rule = cfg.get_app_rule("Spotify");
+        assert_eq!(rule.primary_device, "multi");
+        assert_eq!(rule.secondary_device, "dev_2");
+        assert!(rule.secondary_enabled);
+        assert_eq!(rule.volume, 0.85);
+        assert!(rule.muted);
+
+        let rule_exe = cfg.get_app_rule("spotify.exe");
+        assert_eq!(rule_exe, rule);
+
         assert_eq!(cfg.get_app_volume("spotify.exe"), 0.85);
         assert_eq!(cfg.get_app_volume("Spotify"), 0.85);
-
-        cfg.set_app_mute("spotify.exe".into(), true);
         assert!(cfg.is_app_muted("spotify.exe"));
         assert!(cfg.is_app_muted("Spotify"));
+
+        // Per-App Dual Output helpers
+        cfg.set_app_primary_device("brave.exe".into(), "{dev-speakers}".into());
+        assert_eq!(cfg.get_app_primary_device("brave"), Some("{dev-speakers}".to_string()));
+
+        cfg.set_app_secondary_device("brave.exe".into(), "{dev-headphones}".into());
+        assert_eq!(cfg.get_app_secondary_device("brave"), Some("{dev-headphones}".to_string()));
+        assert_eq!(cfg.get_app_secondary_device("Brave.exe"), Some("{dev-headphones}".to_string()));
+
+        assert!(!cfg.is_app_secondary_enabled("chrome"));
+        cfg.set_app_secondary_enabled("brave.exe".into(), true);
+        assert!(cfg.is_app_secondary_enabled("brave"));
+        assert!(cfg.is_app_secondary_enabled("Brave.exe"));
     }
 
     #[test]
@@ -503,12 +790,56 @@ mod tests {
         cfg.device_volumes.insert("dev_1".into(), 0.5);
         cfg.device_volumes.insert("dev_2".into(), 0.8);
         cfg.device_mutes.insert("dev_2".into(), true);
-        cfg.app_rules.insert("chrome.exe".into(), "multi".into());
-        cfg.app_rules.insert("game.exe".into(), "dev_1".into());
+        cfg.set_app_primary_device("chrome.exe".into(), "multi".into());
+        cfg.set_app_secondary_device("chrome.exe".into(), "dev_2".into());
+        cfg.set_app_secondary_enabled("chrome.exe".into(), true);
+        cfg.set_app_primary_device("game.exe".into(), "dev_1".into());
 
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         let loaded: ConfigV3 = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded, cfg);
+        assert_eq!(loaded.get_app_rule("chrome").primary_device, "multi");
+        assert_eq!(loaded.get_app_rule("chrome").secondary_device, "dev_2");
+        assert!(loaded.get_app_rule("chrome").secondary_enabled);
+    }
+
+    #[test]
+    fn test_config_v3_legacy_fallback() {
+        let legacy_json = r#"{
+            "enabled_devices": ["dev_1"],
+            "device_volumes": {"dev_1": 0.9},
+            "device_mutes": {"dev_1": false},
+            "app_rules": {
+                "spotify.exe": "multi",
+                "discord.exe": "dev_1"
+            },
+            "app_volumes": {
+                "spotify.exe": 0.7
+            },
+            "app_mutes": {
+                "spotify.exe": true
+            }
+        }"#;
+
+        let cfg: ConfigV3 = serde_json::from_str(legacy_json).unwrap();
+        assert!(cfg.apps.is_empty(), "Legacy JSON has no apps field");
+
+        // get_app_rule should fallback to legacy app_rules, app_volumes, app_mutes
+        let spotify_rule = cfg.get_app_rule("spotify");
+        assert_eq!(spotify_rule.primary_device, "multi");
+        assert_eq!(spotify_rule.secondary_device, "");
+        assert!(!spotify_rule.secondary_enabled);
+        assert_eq!(spotify_rule.volume, 0.7);
+        assert!(spotify_rule.muted);
+
+        let discord_rule = cfg.get_app_rule("Discord.exe");
+        assert_eq!(discord_rule.primary_device, "dev_1");
+        assert_eq!(discord_rule.volume, 1.0);
+        assert!(!discord_rule.muted);
+
+        // Unknown app should return default
+        let unknown = cfg.get_app_rule("unknown_app.exe");
+        assert_eq!(unknown, AppRuleV3::default());
     }
 
     #[test]

@@ -36,8 +36,14 @@ pub struct AppAudioSession {
     pub pid: u32,
     pub name: String,
     pub exe_path: Option<String>,
+    pub primary_device_id: String,
+    #[serde(default)]
+    pub secondary_device_id: String,
+    #[serde(default)]
+    pub secondary_enabled: bool,
     pub volume: f32,
-    pub muted: bool,
+    pub is_muted: bool,
+    #[serde(default)]
     pub current_device_id: String,
     #[serde(default)]
     pub sibling_pids: Vec<u32>,
@@ -60,13 +66,26 @@ impl From<AudioDevice> for crate::ui::popup::DeviceItem {
 
 impl From<AppAudioSession> for crate::ui::popup::AppAudioItem {
     fn from(s: AppAudioSession) -> Self {
+        let prim = if !s.primary_device_id.is_empty() {
+            s.primary_device_id.clone()
+        } else {
+            s.current_device_id.clone()
+        };
+        let cur = if !s.current_device_id.is_empty() {
+            s.current_device_id
+        } else {
+            prim.clone()
+        };
         Self {
             pid: s.pid,
             name: s.name,
             exe_path: s.exe_path,
-            current_device_id: s.current_device_id,
+            primary_device_id: prim,
+            secondary_device_id: s.secondary_device_id,
+            secondary_enabled: s.secondary_enabled,
             volume: s.volume,
-            is_muted: s.muted,
+            is_muted: s.is_muted,
+            current_device_id: cur,
         }
     }
 }
@@ -302,7 +321,8 @@ pub fn deduplicate_sessions(
                     existing_sess.exe_path = candidate.exe_path.clone();
                 }
                 existing_sess.volume = candidate.volume;
-                existing_sess.muted = candidate.muted;
+                existing_sess.is_muted = candidate.muted;
+                existing_sess.primary_device_id = candidate.device_id.clone();
                 existing_sess.current_device_id = candidate.device_id.clone();
                 *existing_cand = candidate;
             } else if existing_sess.exe_path.is_none() && candidate.exe_path.is_some() {
@@ -313,8 +333,11 @@ pub fn deduplicate_sessions(
                 pid: candidate.pid,
                 name: candidate.name.clone(),
                 exe_path: candidate.exe_path.clone(),
+                primary_device_id: candidate.device_id.clone(),
+                secondary_device_id: String::new(),
+                secondary_enabled: false,
                 volume: candidate.volume,
-                muted: candidate.muted,
+                is_muted: candidate.muted,
                 current_device_id: candidate.device_id.clone(),
                 sibling_pids: vec![candidate.pid],
             };
@@ -474,6 +497,7 @@ pub fn get_active_app_sessions(devices: &[AudioDevice]) -> Vec<AppAudioSession> 
             }
 
             if let Some(id) = found_persisted {
+                session.primary_device_id = id.clone();
                 session.current_device_id = id;
             }
         }
@@ -648,16 +672,22 @@ mod tests {
             pid: 1234,
             name: "spotify.exe".to_string(),
             exe_path: Some("C:\\spotify.exe".to_string()),
+            primary_device_id: "{0.0.0.00000000}.{test-id}".to_string(),
+            secondary_device_id: "{0.0.0.00000000}.{test-id2}".to_string(),
+            secondary_enabled: true,
             volume: 0.75,
-            muted: false,
+            is_muted: false,
             current_device_id: "{0.0.0.00000000}.{test-id}".to_string(),
             sibling_pids: vec![1234],
         };
         let ui_item: crate::ui::popup::AppAudioItem = session.clone().into();
         assert_eq!(ui_item.pid, session.pid);
         assert_eq!(ui_item.name, session.name);
+        assert_eq!(ui_item.primary_device_id, session.primary_device_id);
+        assert_eq!(ui_item.secondary_device_id, session.secondary_device_id);
+        assert_eq!(ui_item.secondary_enabled, session.secondary_enabled);
         assert_eq!(ui_item.volume, session.volume);
-        assert_eq!(ui_item.is_muted, session.muted);
+        assert_eq!(ui_item.is_muted, session.is_muted);
     }
 
     #[test]
@@ -806,7 +836,7 @@ mod tests {
             .expect("Discord must exist");
         assert_eq!(discord.pid, 2000, "Should prioritize the active session");
         assert_eq!(discord.volume, 0.65);
-        assert_eq!(discord.muted, false);
+        assert_eq!(discord.is_muted, false);
         assert!(discord.sibling_pids.contains(&1000));
         assert!(discord.sibling_pids.contains(&2000));
         assert_eq!(discord.sibling_pids.len(), 2);
@@ -818,7 +848,8 @@ mod tests {
             .expect("Brave must exist");
         assert_eq!(brave.pid, 3002, "Should prioritize the active unmuted session");
         assert_eq!(brave.volume, 0.8);
-        assert_eq!(brave.muted, false);
+        assert_eq!(brave.is_muted, false);
+        assert_eq!(brave.primary_device_id, "dev2");
         assert_eq!(brave.current_device_id, "dev2");
         assert!(brave.sibling_pids.contains(&3001));
         assert!(brave.sibling_pids.contains(&3002));

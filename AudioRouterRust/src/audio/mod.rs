@@ -44,7 +44,7 @@ use std::sync::{Arc, RwLock};
 
 /// High-performance Multi-Output Audio Engine coordinator.
 pub struct MultiOutputEngine {
-    targets: Arc<RwLock<Vec<Arc<RenderTargetState>>>>,
+    pub(crate) targets: Arc<RwLock<Vec<Arc<RenderTargetState>>>>,
     capture_handle: Option<std::thread::JoinHandle<()>>,
     render_workers: HashMap<String, std::thread::JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
@@ -188,7 +188,20 @@ impl MultiOutputEngine {
     pub fn set_device_enabled(&mut self, device_id: &str, enabled: bool) {
         if let Some(target) = self.get_target_by_id(device_id) {
             target.set_enabled(enabled);
-            if self.is_running && enabled {
+            if !enabled {
+                // If disabled, stop and join worker thread immediately to release resources
+                if let Some(handle) = self.render_workers.remove(device_id) {
+                    let _ = handle.join();
+                }
+            } else if self.is_running {
+                // Remove any stale finished handle before re-spawning
+                if let Some(handle) = self.render_workers.get(device_id) {
+                    if handle.is_finished() {
+                        if let Some(h) = self.render_workers.remove(device_id) {
+                            let _ = h.join();
+                        }
+                    }
+                }
                 self.ensure_render_workers();
             }
         }
@@ -208,8 +221,37 @@ impl MultiOutputEngine {
         }
     }
 
+    /// Returns list of device IDs for all currently enabled render targets.
+    pub fn get_enabled_device_ids(&self) -> Vec<String> {
+        self.get_targets()
+            .into_iter()
+            .filter(|t| t.is_enabled())
+            .map(|t| t.device_id.clone())
+            .collect()
+    }
+
+    /// Checks if any secondary (non-default) device is currently enabled.
+    pub fn has_active_secondary(&self) -> bool {
+        self.get_targets()
+            .into_iter()
+            .any(|t| !t.is_default && t.is_enabled())
+    }
+
     /// Helper to ensure all enabled targets have an active render worker thread running.
     fn ensure_render_workers(&mut self) {
+        // Retain only active workers; join any finished ones
+        let finished_keys: Vec<String> = self
+            .render_workers
+            .iter()
+            .filter(|(_, handle)| handle.is_finished())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in finished_keys {
+            if let Some(handle) = self.render_workers.remove(&key) {
+                let _ = handle.join();
+            }
+        }
+
         let capture_rate = self.capture_sample_rate.load(Ordering::Acquire);
         let targets = self.get_targets();
 
@@ -235,5 +277,61 @@ impl Default for MultiOutputEngine {
 impl Drop for MultiOutputEngine {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_multi_output_engine_lifecycle_and_helpers() {
+        let mut engine = MultiOutputEngine::new();
+        assert!(!engine.is_running());
+
+        // Add dummy target states
+        let target1 = Arc::new(RenderTargetState::new(
+            "dev_primary".to_string(),
+            "Speakers".to_string(),
+            true, // default
+        ));
+        let target2 = Arc::new(RenderTargetState::new(
+            "dev_secondary".to_string(),
+            "Headphones".to_string(),
+            false, // non-default
+        ));
+
+        if let Ok(mut guard) = engine.targets.write() {
+            guard.push(target1);
+            guard.push(target2);
+        }
+
+        assert_eq!(engine.get_targets().len(), 2);
+
+        // Initially dev_primary is enabled (since default), dev_secondary is disabled
+        assert!(engine.get_target_by_id("dev_primary").unwrap().is_enabled());
+        assert!(!engine.get_target_by_id("dev_secondary").unwrap().is_enabled());
+        assert!(!engine.has_active_secondary());
+
+        // Enable secondary device
+        engine.set_device_enabled("dev_secondary", true);
+        assert!(engine.get_target_by_id("dev_secondary").unwrap().is_enabled());
+        assert!(engine.has_active_secondary());
+
+        let enabled_ids = engine.get_enabled_device_ids();
+        assert!(enabled_ids.contains(&"dev_primary".to_string()));
+        assert!(enabled_ids.contains(&"dev_secondary".to_string()));
+
+        // Set volume and mute on secondary device
+        engine.set_device_volume("dev_secondary", 0.65);
+        assert_eq!(engine.get_target_by_id("dev_secondary").unwrap().get_volume(), 0.65);
+
+        engine.set_device_muted("dev_secondary", true);
+        assert!(engine.get_target_by_id("dev_secondary").unwrap().is_muted());
+
+        // Disable secondary device
+        engine.set_device_enabled("dev_secondary", false);
+        assert!(!engine.get_target_by_id("dev_secondary").unwrap().is_enabled());
+        assert!(!engine.has_active_secondary());
     }
 }

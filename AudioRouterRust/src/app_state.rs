@@ -21,7 +21,7 @@ use crate::audio::policy_config::{
     get_policy_config_factory, set_app_output_device, IAudioPolicyConfigFactory,
 };
 use crate::audio::MultiOutputEngine;
-use crate::config::rules::{load_config_v3, load_rules, normalize_app_key, save_rules};
+use crate::config::rules::{load_config_v3, load_rules, save_rules};
 use crate::ui::popup::{AppAudioItem, DeviceItem};
 
 /// Central state holder for AudioRouter.
@@ -73,13 +73,31 @@ impl AppState {
         let default_dev = get_default_render_device().ok().flatten();
         let default_id = default_dev.as_ref().map(|d| d.id.as_str());
 
-        // If config_v3 has enabled_devices, apply them; if empty, enable default render device
-        if config_v3.enabled_devices.is_empty() {
+        // Gather all secondary devices from apps where secondary_enabled == true
+        let mut active_secondary_devices: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_app_key, rule) in &config_v3.apps {
+            if rule.secondary_enabled && !rule.secondary_device.is_empty() {
+                active_secondary_devices.insert(rule.secondary_device.clone());
+            }
+        }
+        for (app_key, sec_id) in &config_v3.app_secondary_rules {
+            if config_v3.is_app_secondary_enabled(app_key) && !sec_id.is_empty() {
+                active_secondary_devices.insert(sec_id.clone());
+            }
+        }
+        for dev_id in &config_v3.enabled_devices {
+            if !dev_id.is_empty() {
+                active_secondary_devices.insert(dev_id.clone());
+            }
+        }
+
+        // Enable targets: secondary devices enabled by apps, or default device if empty
+        if active_secondary_devices.is_empty() {
             if let Some(def_id) = default_id {
                 multi_engine.set_device_enabled(def_id, true);
             }
         } else {
-            for dev_id in &config_v3.enabled_devices {
+            for dev_id in &active_secondary_devices {
                 multi_engine.set_device_enabled(dev_id, true);
             }
         }
@@ -118,18 +136,37 @@ impl AppState {
     }
 
     /// Synchronizes MultiOutputEngine targets and volume/mute settings with ConfigV3.
+    /// In the Per-App Dual Output architecture, secondary endpoints are enabled
+    /// when at least one application has `secondary_enabled == true` targeting that endpoint.
     pub fn sync_multi_engine(&self) {
         let config = load_config_v3();
         if let Ok(mut engine) = self.multi_engine.write() {
             let _ = engine.refresh_targets();
             let targets = engine.get_targets();
+
+            // Collect active secondary devices across apps and legacy configs
+            let mut active_secondary_devices: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (_app_key, rule) in &config.apps {
+                if rule.secondary_enabled && !rule.secondary_device.is_empty() {
+                    active_secondary_devices.insert(rule.secondary_device.clone());
+                }
+            }
+            for (app_key, sec_id) in &config.app_secondary_rules {
+                if config.is_app_secondary_enabled(app_key) && !sec_id.is_empty() {
+                    active_secondary_devices.insert(sec_id.clone());
+                }
+            }
+            for dev_id in &config.enabled_devices {
+                if !dev_id.is_empty() {
+                    active_secondary_devices.insert(dev_id.clone());
+                }
+            }
+
             for t in targets {
-                let enabled = if config.enabled_devices.is_empty() {
-                    t.is_default
-                } else {
-                    config.is_device_enabled(&t.device_id)
-                };
-                engine.set_device_enabled(&t.device_id, enabled);
+                let should_enable = active_secondary_devices.contains(&t.device_id)
+                    || (t.is_default && active_secondary_devices.is_empty());
+
+                engine.set_device_enabled(&t.device_id, should_enable);
                 engine.set_device_volume(&t.device_id, config.get_device_volume(&t.device_id));
                 engine.set_device_muted(&t.device_id, config.is_device_muted(&t.device_id));
             }
@@ -184,16 +221,17 @@ impl AppState {
             .collect();
 
         for app in &mut apps {
-            if let Some(rule) = config.get_app_rule(&app.name) {
-                if rule == "multi" {
-                    app.current_device_id = "multi".to_string();
-                } else if !rule.is_empty() {
-                    app.current_device_id = rule.clone();
-                }
+            let rule = config.get_app_rule(&app.name);
+            if !rule.primary_device.is_empty() {
+                app.primary_device_id = rule.primary_device.clone();
+                app.current_device_id = rule.primary_device.clone();
             }
-            if config.is_app_muted(&app.name) {
-                app.is_muted = true;
+            if !rule.secondary_device.is_empty() {
+                app.secondary_device_id = rule.secondary_device.clone();
             }
+            app.secondary_enabled = rule.secondary_enabled;
+            app.is_muted = rule.muted;
+            app.volume = rule.volume;
         }
         apps
     }
@@ -228,21 +266,31 @@ impl AppState {
         None
     }
 
-    /// Iterates through all active application audio sessions and applies persisted rules.
+    /// Iterates through all active application audio sessions and applies persisted rules:
+    /// - Primary device routing via Windows Audio Policy (`IAudioPolicyConfigFactory`)
+    /// - Secondary device activation/deactivation in `MultiOutputEngine`
+    /// - Per-app volume and mute restoration
     pub fn apply_all_rules(&mut self, force: bool) -> usize {
         let mut count = 0;
+
+        // 1. Synchronize secondary render targets in MultiOutputEngine
+        self.sync_multi_engine();
+
         let config = load_config_v3();
         let sessions = get_active_app_sessions(&self.devices);
 
+        // 2. For each active app session: route primary endpoint and apply volume/mute
         for session in &sessions {
-            // Check ConfigV3 app_rules first, fallback to self.rules
-            let target_rule = config.get_app_rule(&session.name).cloned().or_else(|| {
+            let app_rule = config.get_app_rule(&session.name);
+            let target_rule = if !app_rule.primary_device.is_empty() {
+                Some(app_rule.primary_device.clone())
+            } else {
                 self.get_rule(&session.name).cloned()
-            });
+            };
 
             if let Some(rule) = target_rule {
                 if rule == "multi" || rule.is_empty() {
-                    // Reset to default device so master loopback captures it for multi-output
+                    // Reset to default device (None) so master loopback captures it for multi-output
                     let _ = set_app_output_device(&self.factory, session.pid, eRender, None);
                     let sibling_pids = get_pids_by_process_name(&session.name);
                     for pid in sibling_pids {
@@ -276,12 +324,8 @@ impl AppState {
             }
 
             // Restore app volume & mute if specified in ConfigV3
-            if let Some(&vol) = config.app_volumes.get(&normalize_app_key(&session.name)) {
-                let _ = crate::audio::set_app_volume(session.pid, &session.current_device_id, vol);
-            }
-            if let Some(&muted) = config.app_mutes.get(&normalize_app_key(&session.name)) {
-                let _ = crate::audio::set_app_mute(session.pid, &session.current_device_id, muted);
-            }
+            let _ = crate::audio::set_app_volume(session.pid, &session.current_device_id, app_rule.volume);
+            let _ = crate::audio::set_app_mute(session.pid, &session.current_device_id, app_rule.muted);
         }
 
         count
@@ -294,9 +338,12 @@ impl AppState {
 
         for session in sessions {
             if session.pid == pid {
-                let target_rule = config.get_app_rule(&session.name).cloned().or_else(|| {
+                let app_rule = config.get_app_rule(&session.name);
+                let target_rule = if !app_rule.primary_device.is_empty() {
+                    Some(app_rule.primary_device)
+                } else {
                     self.get_rule(&session.name).cloned()
-                });
+                };
 
                 if let Some(rule) = target_rule {
                     let endpoint_param = if rule == "multi" || rule.is_empty() {
@@ -323,12 +370,8 @@ impl AppState {
                         }
                     }
 
-                    if let Some(&vol) = config.app_volumes.get(&normalize_app_key(&session.name)) {
-                        let _ = crate::audio::set_app_volume(session.pid, &session.current_device_id, vol);
-                    }
-                    if let Some(&muted) = config.app_mutes.get(&normalize_app_key(&session.name)) {
-                        let _ = crate::audio::set_app_mute(session.pid, &session.current_device_id, muted);
-                    }
+                    let _ = crate::audio::set_app_volume(session.pid, &session.current_device_id, app_rule.volume);
+                    let _ = crate::audio::set_app_mute(session.pid, &session.current_device_id, app_rule.muted);
 
                     return res.is_ok();
                 }
@@ -342,8 +385,13 @@ impl AppState {
     /// Assigns a routing rule for an application, persists to disk, and applies immediately.
     pub fn set_rule(&mut self, app_name: String, device_id: String) -> windows::core::Result<()> {
         let app_lower = app_name.to_lowercase();
-        self.rules.insert(app_lower, device_id);
+        self.rules.insert(app_lower, device_id.clone());
         let _ = self.save_current_rules();
+
+        let mut config = load_config_v3();
+        config.set_app_primary_device(app_name, device_id);
+        let _ = crate::config::rules::save_config_v3(&config);
+
         self.apply_all_rules(true);
         Ok(())
     }
@@ -353,13 +401,19 @@ impl AppState {
         let app_lower = app_name.to_lowercase();
         if self.rules.remove(&app_lower).is_some() {
             let _ = self.save_current_rules();
-            let sessions = get_active_app_sessions(&self.devices);
-            for session in sessions {
-                if session.name.to_lowercase() == app_lower {
-                    let _ = set_app_output_device(&self.factory, session.pid, eRender, None);
-                }
+        }
+
+        let mut config = load_config_v3();
+        let _ = config.remove_app_rule(app_name);
+        let _ = crate::config::rules::save_config_v3(&config);
+
+        let sessions = get_active_app_sessions(&self.devices);
+        for session in sessions {
+            if session.name.to_lowercase() == app_lower {
+                let _ = set_app_output_device(&self.factory, session.pid, eRender, None);
             }
         }
+        self.apply_all_rules(true);
         Ok(())
     }
 }
@@ -367,5 +421,98 @@ impl AppState {
 impl Drop for AppState {
     fn drop(&mut self) {
         let _ = unregister_device_hotplug(&self.enumerator, &self.hotplug_client);
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::render::RenderTargetState;
+    use crate::config::rules::ConfigV3;
+
+    #[test]
+    fn test_app_state_rule_lookup_normalization() {
+        let mut rules = BTreeMap::new();
+        rules.insert("spotify.exe".to_string(), "dev_1".to_string());
+        rules.insert("chrome".to_string(), "dev_2".to_string());
+
+        let name_lower = "SPOTIFY.EXE".to_lowercase();
+        assert_eq!(rules.get(&name_lower), Some(&"dev_1".to_string()));
+        let name_no_ext = "spotify";
+        let found = rules.iter().find(|(k, _)| {
+            let kl = k.to_lowercase();
+            kl.strip_suffix(".exe").unwrap_or(&kl) == name_no_ext
+        });
+        assert_eq!(found.map(|(_, v)| v), Some(&"dev_1".to_string()));
+    }
+
+    #[test]
+    fn test_sync_multi_engine_dual_output_logic() {
+        let mut engine = MultiOutputEngine::new();
+        let target_default = Arc::new(RenderTargetState::new(
+            "dev_speakers".to_string(),
+            "Realtek Speakers".to_string(),
+            true,
+        ));
+        let target_headphones = Arc::new(RenderTargetState::new(
+            "dev_headphones".to_string(),
+            "Bluetooth Headphones".to_string(),
+            false,
+        ));
+
+        if let Ok(mut guard) = engine.targets.write() {
+            guard.push(target_default);
+            guard.push(target_headphones);
+        }
+
+        // Initially dev_headphones is disabled
+        assert!(!engine.get_target_by_id("dev_headphones").unwrap().is_enabled());
+
+        // Simulate config with Per-App Dual Output enabled for Spotify
+        let mut cfg = ConfigV3::new();
+        cfg.set_app_primary_device("spotify.exe".into(), "dev_speakers".into());
+        cfg.set_app_secondary_device("spotify.exe".into(), "dev_headphones".into());
+        cfg.set_app_secondary_enabled("spotify.exe".into(), true);
+
+        // Gather active secondary devices
+        let mut active_secondary_devices: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_app_key, rule) in &cfg.apps {
+            if rule.secondary_enabled && !rule.secondary_device.is_empty() {
+                active_secondary_devices.insert(rule.secondary_device.clone());
+            }
+        }
+        assert!(active_secondary_devices.contains("dev_headphones"));
+
+        // Apply to engine targets
+        for t in engine.get_targets() {
+            let should_enable = active_secondary_devices.contains(&t.device_id)
+                || (t.is_default && active_secondary_devices.is_empty());
+            engine.set_device_enabled(&t.device_id, should_enable);
+        }
+
+        // dev_headphones is now enabled as a secondary render target
+        assert!(engine.get_target_by_id("dev_headphones").unwrap().is_enabled());
+        assert!(engine.has_active_secondary());
+
+        // Now simulate user toggling secondary_enabled to false
+        cfg.set_app_secondary_enabled("spotify.exe".into(), false);
+        let mut active_secondary_devices2: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_app_key, rule) in &cfg.apps {
+            if rule.secondary_enabled && !rule.secondary_device.is_empty() {
+                active_secondary_devices2.insert(rule.secondary_device.clone());
+            }
+        }
+        assert!(!active_secondary_devices2.contains("dev_headphones"));
+
+        for t in engine.get_targets() {
+            let should_enable = active_secondary_devices2.contains(&t.device_id)
+                || (t.is_default && active_secondary_devices2.is_empty());
+            engine.set_device_enabled(&t.device_id, should_enable);
+        }
+
+        // dev_headphones is now disabled to save CPU and audio resources
+        assert!(!engine.get_target_by_id("dev_headphones").unwrap().is_enabled());
+        assert!(!engine.has_active_secondary());
     }
 }

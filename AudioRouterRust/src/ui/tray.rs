@@ -264,6 +264,9 @@ impl TrayIcon {
     /// Adds the icon to the notification area with retries and version negotiation
     pub fn add(&mut self) -> Result<(), windows::core::Error> {
         unsafe {
+            // Delete any stale icon instance first to prevent collision
+            let _ = Shell_NotifyIconW(NIM_DELETE, &self.nid);
+
             let mut added = false;
 
             // Attempt NIM_ADD with retry up to 10 times in case Explorer is initializing
