@@ -254,10 +254,17 @@ fn should_replace_primary(existing: &CandidateSession, incoming: &CandidateSessi
     false
 }
 
+/// Checks if a session name indicates an orphaned ghost/zombie process without an active executable.
+pub fn is_ghost_session(name: &str) -> bool {
+    let lower = name.trim().to_lowercase();
+    lower.starts_with("process (") || lower.starts_with("pid:")
+}
+
 /// Consolidates raw candidate sessions:
-/// 1. Filters out self process (AudioRouter / current PID).
-/// 2. Deduplicates sessions belonging to the same application (e.g. Discord, Chrome, Brave).
-/// 3. Retains the active / primary session representation, tracks all sibling PIDs.
+/// 1. Filters out ghost / terminated process sessions.
+/// 2. Filters out self process (AudioRouter / current PID).
+/// 3. Deduplicates sessions belonging to the same application (e.g. Discord, Chrome, Brave).
+/// 4. Retains the active / primary session representation, tracks all sibling PIDs.
 pub fn deduplicate_sessions(
     candidates: impl IntoIterator<Item = CandidateSession>,
     current_pid: u32,
@@ -265,6 +272,11 @@ pub fn deduplicate_sessions(
     let mut map: HashMap<String, (CandidateSession, AppAudioSession)> = HashMap::new();
 
     for candidate in candidates {
+        // Ghost filtering: skip unidentifiable / terminated process sessions
+        if is_ghost_session(&candidate.name) {
+            continue;
+        }
+
         // Self-filtering: skip current process or audiorouter executables
         if is_self_process(
             candidate.pid,
@@ -373,6 +385,11 @@ pub fn get_active_app_sessions(devices: &[AudioDevice]) -> Vec<AppAudioSession> 
                     continue;
                 };
 
+                // Skip system sound sessions (e.g. system notification chimes)
+                if control2.IsSystemSoundsSession() == windows::Win32::Foundation::S_OK {
+                    continue;
+                }
+
                 let Ok(pid) = control2.GetProcessId() else {
                     continue;
                 };
@@ -383,6 +400,11 @@ pub fn get_active_app_sessions(devices: &[AudioDevice]) -> Vec<AppAudioSession> 
                 }
 
                 let (name, exe_path) = get_process_info(pid);
+
+                // Skip ghost / zombie / unidentifiable sessions of terminated processes
+                if exe_path.is_none() || is_ghost_session(&name) {
+                    continue;
+                }
 
                 // Early filter for self process
                 if is_self_process(pid, &name, exe_path.as_deref(), current_pid) {
@@ -864,5 +886,54 @@ mod tests {
                 key
             );
         }
+    }
+
+    #[test]
+    fn test_filter_ghost_and_system_sessions() {
+        let current_pid = 7777;
+        let candidates = vec![
+            CandidateSession {
+                pid: 11344,
+                name: "Process (11344)".to_string(),
+                exe_path: None,
+                volume: 1.0,
+                muted: false,
+                device_id: "dev1".to_string(),
+                is_active: false,
+            },
+            CandidateSession {
+                pid: 11345,
+                name: "PID: 11345".to_string(),
+                exe_path: None,
+                volume: 0.8,
+                muted: false,
+                device_id: "dev1".to_string(),
+                is_active: true,
+            },
+            CandidateSession {
+                pid: 11346,
+                name: "process (8888)".to_string(),
+                exe_path: None,
+                volume: 0.5,
+                muted: true,
+                device_id: "dev2".to_string(),
+                is_active: false,
+            },
+            CandidateSession {
+                pid: 5000,
+                name: "spotify.exe".to_string(),
+                exe_path: Some("C:\\Spotify\\spotify.exe".to_string()),
+                volume: 0.7,
+                muted: false,
+                device_id: "dev1".to_string(),
+                is_active: true,
+            },
+        ];
+
+        let result = deduplicate_sessions(candidates, current_pid);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "spotify.exe");
+        assert_eq!(result[0].pid, 5000);
+        assert!(!result.iter().any(|s| is_ghost_session(&s.name)));
     }
 }

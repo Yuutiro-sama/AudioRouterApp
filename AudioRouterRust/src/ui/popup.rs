@@ -51,6 +51,8 @@ use crate::ipc_messages::WM_APP_APPLY_RULES;
 static CURRENT_FLYOUT: AtomicUsize = AtomicUsize::new(0);
 
 const TBM_GETPOS: u32 = 0x0400; // WM_USER
+const TBM_SETPAGESIZE: u32 = 0x0415; // WM_USER + 21 (step per click on channel: 5%)
+const TBM_SETLINESIZE: u32 = 0x0417; // WM_USER + 23 (step per keyboard arrow key: 1%)
 const TIMER_ID_STATS: usize = 1;
 
 const SS_LEFT: WINDOW_STYLE = WINDOW_STYLE(0x00000000);
@@ -789,6 +791,9 @@ pub fn toggle_flyout(
                     WPARAM(1),
                     LPARAM(((100u32 << 16) | 0u32) as isize),
                 );
+                // Click step 5%, line step 1%
+                let _ = SendMessageW(slider_hwnd, TBM_SETPAGESIZE, WPARAM(0), LPARAM(5));
+                let _ = SendMessageW(slider_hwnd, TBM_SETLINESIZE, WPARAM(0), LPARAM(1));
                 let vol_val = (dev.volume * 100.0).clamp(0.0, 100.0) as u32;
                 let _ = SendMessageW(slider_hwnd, TBM_SETPOS, WPARAM(1), LPARAM(vol_val as isize));
                 // Requirement 2: Subclass trackbar to prevent 20% mousewheel jump and forward to container scroll
@@ -1080,6 +1085,9 @@ pub fn toggle_flyout(
                     WPARAM(1),
                     LPARAM(((100u32 << 16) | 0u32) as isize),
                 );
+                // Click step 5%, line step 1%
+                let _ = SendMessageW(slider_hwnd, TBM_SETPAGESIZE, WPARAM(0), LPARAM(5));
+                let _ = SendMessageW(slider_hwnd, TBM_SETLINESIZE, WPARAM(0), LPARAM(1));
                 let vol_val = (app.volume * 100.0).clamp(0.0, 100.0) as u32;
                 let _ = SendMessageW(slider_hwnd, TBM_SETPOS, WPARAM(1), LPARAM(vol_val as isize));
                 // Requirement 2: Subclass trackbar
