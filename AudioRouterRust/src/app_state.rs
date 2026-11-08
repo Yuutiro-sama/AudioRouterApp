@@ -71,45 +71,35 @@ impl AppState {
 
         let config_v3 = load_config_v3();
         let default_dev = get_default_render_device().ok().flatten();
-        let default_id = default_dev.as_ref().map(|d| d.id.as_str());
+        let default_id = default_dev.as_ref().map(|d| d.id.as_str()).unwrap_or_default();
 
-        // Gather all secondary devices from apps where secondary_enabled == true
-        let mut active_secondary_devices: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut active_pairs: Vec<(String, String)> = Vec::new();
+
         for (_app_key, rule) in &config_v3.apps {
             if rule.secondary_enabled && !rule.secondary_device.is_empty() {
-                active_secondary_devices.insert(rule.secondary_device.clone());
+                let source = if !rule.primary_device.is_empty() && rule.primary_device != "multi" {
+                    rule.primary_device.clone()
+                } else {
+                    default_id.to_string()
+                };
+                let target = rule.secondary_device.clone();
+                if source != target && !target.is_empty() {
+                    active_pairs.push((source, target));
+                }
             }
         }
         for (app_key, sec_id) in &config_v3.app_secondary_rules {
             if config_v3.is_app_secondary_enabled(app_key) && !sec_id.is_empty() {
-                active_secondary_devices.insert(sec_id.clone());
-            }
-        }
-        for dev_id in &config_v3.enabled_devices {
-            if !dev_id.is_empty() {
-                active_secondary_devices.insert(dev_id.clone());
+                let prim = config_v3.get_legacy_app_rule(app_key).cloned().unwrap_or_else(|| default_id.to_string());
+                let source = if !prim.is_empty() && prim != "multi" { prim } else { default_id.to_string() };
+                let target = sec_id.clone();
+                if source != target && !target.is_empty() && !active_pairs.contains(&(source.clone(), target.clone())) {
+                    active_pairs.push((source, target));
+                }
             }
         }
 
-        // Enable targets: secondary devices enabled by apps, or default device if empty
-        if active_secondary_devices.is_empty() {
-            if let Some(def_id) = default_id {
-                multi_engine.set_device_enabled(def_id, true);
-            }
-        } else {
-            for dev_id in &active_secondary_devices {
-                multi_engine.set_device_enabled(dev_id, true);
-            }
-        }
-        for (dev_id, &vol) in &config_v3.device_volumes {
-            multi_engine.set_device_volume(dev_id, vol);
-        }
-        for (dev_id, &mute) in &config_v3.device_mutes {
-            multi_engine.set_device_muted(dev_id, mute);
-        }
-
-        // Start capture and render workers
-        let _ = multi_engine.start();
+        multi_engine.sync_bridges(active_pairs);
 
         let multi_engine = Arc::new(RwLock::new(multi_engine));
 
@@ -140,35 +130,44 @@ impl AppState {
     /// when at least one application has `secondary_enabled == true` targeting that endpoint.
     pub fn sync_multi_engine(&self) {
         let config = load_config_v3();
+        let default_dev = get_default_render_device().ok().flatten();
+        let default_id = default_dev.as_ref().map(|d| d.id.as_str()).unwrap_or_default();
+
+        let mut active_pairs: Vec<(String, String)> = Vec::new();
+
+        for (_app_key, rule) in &config.apps {
+            if rule.secondary_enabled && !rule.secondary_device.is_empty() {
+                let source = if !rule.primary_device.is_empty() && rule.primary_device != "multi" {
+                    rule.primary_device.clone()
+                } else {
+                    default_id.to_string()
+                };
+                let target = rule.secondary_device.clone();
+                if source != target && !target.is_empty() {
+                    active_pairs.push((source, target));
+                }
+            }
+        }
+        for (app_key, sec_id) in &config.app_secondary_rules {
+            if config.is_app_secondary_enabled(app_key) && !sec_id.is_empty() {
+                let prim = config.get_legacy_app_rule(app_key).cloned().unwrap_or_else(|| default_id.to_string());
+                let source = if !prim.is_empty() && prim != "multi" { prim } else { default_id.to_string() };
+                let target = sec_id.clone();
+                if source != target && !target.is_empty() && !active_pairs.contains(&(source.clone(), target.clone())) {
+                    active_pairs.push((source, target));
+                }
+            }
+        }
+
         if let Ok(mut engine) = self.multi_engine.write() {
             let _ = engine.refresh_targets();
-            let targets = engine.get_targets();
+            engine.sync_bridges(active_pairs);
 
-            // Collect active secondary devices across apps and legacy configs
-            let mut active_secondary_devices: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for (_app_key, rule) in &config.apps {
-                if rule.secondary_enabled && !rule.secondary_device.is_empty() {
-                    active_secondary_devices.insert(rule.secondary_device.clone());
-                }
+            for (dev_id, &vol) in &config.device_volumes {
+                engine.set_bridge_volume(dev_id, vol);
             }
-            for (app_key, sec_id) in &config.app_secondary_rules {
-                if config.is_app_secondary_enabled(app_key) && !sec_id.is_empty() {
-                    active_secondary_devices.insert(sec_id.clone());
-                }
-            }
-            for dev_id in &config.enabled_devices {
-                if !dev_id.is_empty() {
-                    active_secondary_devices.insert(dev_id.clone());
-                }
-            }
-
-            for t in targets {
-                let should_enable = active_secondary_devices.contains(&t.device_id)
-                    || (t.is_default && active_secondary_devices.is_empty());
-
-                engine.set_device_enabled(&t.device_id, should_enable);
-                engine.set_device_volume(&t.device_id, config.get_device_volume(&t.device_id));
-                engine.set_device_muted(&t.device_id, config.is_device_muted(&t.device_id));
+            for (dev_id, &mute) in &config.device_mutes {
+                engine.set_bridge_muted(dev_id, mute);
             }
         }
     }

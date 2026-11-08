@@ -15,6 +15,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu,
+    GetSystemMetrics, LoadImageW, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, SM_CXSMICON, SM_CYSMICON,
     GetCursorPos, PostMessageW, RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu,
     HICON, ICONINFO, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, TPM_BOTTOMALIGN,
     TPM_RIGHTBUTTON, WM_NULL,
@@ -235,7 +236,21 @@ impl TrayIcon {
 
     /// Creates and initializes a new system tray icon
     pub fn new(hwnd: HWND, callback_msg: u32, tooltip: &str) -> Result<Self, windows::core::Error> {
-        let icon = create_speaker_icon()?;
+        let instance = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default() };
+        let res_icon = unsafe {
+            LoadImageW(
+                instance,
+                PCWSTR(1 as _),
+                IMAGE_ICON,
+                GetSystemMetrics(SM_CXSMICON),
+                GetSystemMetrics(SM_CYSMICON),
+                LR_DEFAULTCOLOR | LR_SHARED,
+            )
+        };
+        let icon = match res_icon {
+            Ok(h) if !h.is_invalid() => HICON(h.0),
+            _ => create_speaker_icon()?,
+        };
 
         let mut nid = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -267,19 +282,8 @@ impl TrayIcon {
             // Delete any stale icon instance first to prevent collision
             let _ = Shell_NotifyIconW(NIM_DELETE, &self.nid);
 
-            let mut added = false;
-
-            // Attempt NIM_ADD with retry up to 10 times in case Explorer is initializing
-            for _ in 0..10 {
-                let res = Shell_NotifyIconW(NIM_ADD, &self.nid);
-                if res.as_bool() {
-                    added = true;
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(150));
-            }
-
-            if !added {
+            let res = Shell_NotifyIconW(NIM_ADD, &self.nid);
+            if !res.as_bool() {
                 return Err(windows::core::Error::from_win32());
             }
 

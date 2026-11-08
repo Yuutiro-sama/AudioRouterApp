@@ -46,6 +46,7 @@ struct DispatcherData {
     app_state: AppState,
     tray_icon: TrayIcon,
     taskbar_created_msg: u32,
+    show_ui_msg: u32,
 }
 
 static LAST_TRAY_CLICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -71,6 +72,17 @@ unsafe extern "system" fn dispatcher_wndproc(
     // 1. Check if Explorer was restarted (TaskbarCreated broadcast)
     if msg == data.taskbar_created_msg {
         let _ = data.tray_icon.recreate();
+        return LRESULT(0);
+    }
+
+    // 2. Check if another instance requested to show the UI
+    if msg == data.show_ui_msg && data.show_ui_msg != 0 {
+        debug_log("dispatcher_wndproc: show_ui_msg broadcast received");
+        data.app_state.refresh_devices();
+        let device_items = data.app_state.get_device_items();
+        let app_items = data.app_state.get_app_items();
+        let tray_rect = data.tray_icon.get_rect();
+        toggle_flyout(hwnd, device_items, app_items, tray_rect);
         return LRESULT(0);
     }
 
@@ -101,12 +113,14 @@ unsafe extern "system" fn dispatcher_wndproc(
 
         WM_COMMAND => {
             let cmd_id = (wparam.0 as usize) & 0xFFFF;
+            debug_log(&format!("dispatcher_wndproc: WM_COMMAND received, cmd_id={}", cmd_id));
             match cmd_id {
                 IDM_SHOW_UI => {
                     data.app_state.refresh_devices();
                     let device_items = data.app_state.get_device_items();
                     let app_items = data.app_state.get_app_items();
                     let tray_rect = data.tray_icon.get_rect();
+                    debug_log(&format!("Calling toggle_flyout with {} apps, {} devices", app_items.len(), device_items.len()));
                     toggle_flyout(hwnd, device_items, app_items, tray_rect);
                     LRESULT(0)
                 }
@@ -202,20 +216,33 @@ fn debug_log(msg: &str) {
 }
 
 fn main() -> windows::core::Result<()> {
+    std::panic::set_hook(Box::new(|info| {
+        debug_log(&format!("FATAL PANIC: {:?}", info));
+    }));
     debug_log("AudioRouter main() started");
     // 1. Single Instance Guard via Win32 Named Mutex
     let mutex_name = w!("AudioRouterApp_SingleInstance");
     let mutex_handle = unsafe { CreateMutexW(None, true, mutex_name) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         debug_log("Instance already exists, sending IDM_SHOW_UI and exiting");
-        // If an instance is already running, ping it to toggle/show the UI!
         unsafe {
+            let broadcast_msg = windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(w!("AudioRouter_ShowUI"));
+            if broadcast_msg != 0 {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    windows::Win32::UI::WindowsAndMessaging::HWND_BROADCAST,
+                    broadcast_msg,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+
+            let _ = windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
             let existing_hwnd = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
                 w!("AudioRouterDispatcherClass"),
                 None,
             );
             if let Ok(h) = existing_hwnd {
-                if !h.is_invalid() {
+                if !h.is_invalid() && !h.0.is_null() {
                     let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                         h,
                         windows::Win32::UI::WindowsAndMessaging::WM_COMMAND,
@@ -237,37 +264,6 @@ fn main() -> windows::core::Result<()> {
     // 3. Initialize COM MTA/STA (APARTMENTTHREADED is ideal for Shell_NotifyIcon and message pump)
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-    }
-
-    // Attach GUI thread to interactive 'Default' desktop of WinSta0 if started from worker session
-    unsafe {
-        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-        if let Ok(user32) = LoadLibraryW(w!("user32.dll")) {
-            type PfnOpenDesktopW = unsafe extern "system" fn(
-                windows::core::PCWSTR,
-                u32,
-                windows::Win32::Foundation::BOOL,
-                u32,
-            ) -> windows::Win32::Foundation::HANDLE;
-            type PfnSetThreadDesktop =
-                unsafe extern "system" fn(windows::Win32::Foundation::HANDLE) -> windows::Win32::Foundation::BOOL;
-
-            if let Some(p_open) = GetProcAddress(user32, windows::core::s!("OpenDesktopW")) {
-                if let Some(p_set) = GetProcAddress(user32, windows::core::s!("SetThreadDesktop")) {
-                    let open_fn: PfnOpenDesktopW = std::mem::transmute(p_open);
-                    let set_fn: PfnSetThreadDesktop = std::mem::transmute(p_set);
-                    let hdesk = open_fn(
-                        w!("Default"),
-                        0,
-                        windows::Win32::Foundation::BOOL(0),
-                        0x01FF,
-                    );
-                    if !hdesk.is_invalid() {
-                        let _ = set_fn(hdesk);
-                    }
-                }
-            }
-        }
     }
 
     // 4. Register Dispatcher Hidden Window Class
@@ -352,10 +348,12 @@ fn main() -> windows::core::Result<()> {
     let _ = app_state.apply_all_rules(false);
 
     // Attach state to window user data
+    let show_ui_msg = unsafe { windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(w!("AudioRouter_ShowUI")) };
     let dispatcher_data = Box::new(DispatcherData {
         app_state,
         tray_icon,
         taskbar_created_msg,
+        show_ui_msg,
     });
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(dispatcher_data) as isize);

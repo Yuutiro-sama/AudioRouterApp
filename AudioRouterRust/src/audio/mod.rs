@@ -4,6 +4,7 @@
 //! hardware hotplug notifications, per-app routing via `IAudioPolicyConfigFactory`,
 //! and real-time Multi-Output DSP Mixing Engine.
 
+pub mod bridge;
 pub mod capture;
 pub mod dsp;
 pub mod enumerator;
@@ -11,6 +12,8 @@ pub mod notification;
 pub mod policy_config;
 pub mod render;
 pub mod ring_buffer;
+
+pub use bridge::DualOutputBridge;
 
 pub use capture::{
     spawn_master_loopback_worker, AudioClientActivationParams, AudioClientActivationType,
@@ -47,6 +50,7 @@ pub struct MultiOutputEngine {
     pub(crate) targets: Arc<RwLock<Vec<Arc<RenderTargetState>>>>,
     capture_handle: Option<std::thread::JoinHandle<()>>,
     render_workers: HashMap<String, std::thread::JoinHandle<()>>,
+    bridges: HashMap<(String, String), DualOutputBridge>,
     stop_signal: Arc<AtomicBool>,
     capture_sample_rate: Arc<AtomicU32>,
     is_running: bool,
@@ -59,6 +63,7 @@ impl MultiOutputEngine {
             targets: Arc::new(RwLock::new(Vec::new())),
             capture_handle: None,
             render_workers: HashMap::new(),
+            bridges: HashMap::new(),
             stop_signal: Arc::new(AtomicBool::new(false)),
             capture_sample_rate: Arc::new(AtomicU32::new(48000)),
             is_running: false,
@@ -181,7 +186,54 @@ impl MultiOutputEngine {
             let _ = handle.join();
         }
 
+        for (_, mut bridge) in self.bridges.drain() {
+            bridge.stop();
+        }
+
         self.is_running = false;
+    }
+
+    /// Synchronizes active per-app dual-output bridges.
+    /// `active_routes`: list of (source_device_id, target_device_id) pairs
+    pub fn sync_bridges(&mut self, active_routes: Vec<(String, String)>) {
+        let mut needed_set: std::collections::HashSet<(String, String)> =
+            active_routes.into_iter().collect();
+
+        // 1. Remove bridges that are no longer needed
+        self.bridges.retain(|k, bridge| {
+            if needed_set.contains(k) {
+                needed_set.remove(k);
+                true
+            } else {
+                bridge.stop();
+                false
+            }
+        });
+
+        // 2. Start newly requested bridges
+        for (source_id, target_id) in needed_set {
+            if let Ok(bridge) = DualOutputBridge::start(source_id.clone(), target_id.clone()) {
+                self.bridges.insert((source_id, target_id), bridge);
+            }
+        }
+    }
+
+    /// Sets volume on all bridges targeting `target_device_id`.
+    pub fn set_bridge_volume(&self, target_device_id: &str, volume: f32) {
+        for ((_, tgt), b) in &self.bridges {
+            if tgt == target_device_id {
+                b.set_volume(volume);
+            }
+        }
+    }
+
+    /// Sets mute on all bridges targeting `target_device_id`.
+    pub fn set_bridge_muted(&self, target_device_id: &str, muted: bool) {
+        for ((_, tgt), b) in &self.bridges {
+            if tgt == target_device_id {
+                b.set_muted(muted);
+            }
+        }
     }
 
     /// Enables or disables output to a specific audio endpoint.

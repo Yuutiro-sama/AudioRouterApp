@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Gdi::{
     HBRUSH, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::ProcessStatus::K32EmptyWorkingSet;
-use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
+use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, SetScrollInfo, DRAWITEMSTRUCT, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES,
     INITCOMMONCONTROLSEX, ODS_SELECTED, TBM_SETPOS, TBM_SETRANGE, TBS_AUTOTICKS, TBS_HORZ,
@@ -28,17 +28,20 @@ use windows::Win32::UI::Shell::{DefSubclassProc, ExtractIconExW, SetWindowSubcla
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CreateWindowExW, DefWindowProcW, DeferWindowPos, DestroyIcon,
     DestroyWindow, EndDeferWindowPos, GetClientRect, GetCursorPos, GetDlgCtrlID, GetParent,
-    GetScrollInfo, GetWindowLongPtrW, GetWindowThreadProcessId, PostMessageW, RegisterClassExW,
+    GetScrollInfo, GetWindowLongPtrW, PostMessageW, RegisterClassExW,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowWindow, BN_CLICKED, BS_OWNERDRAW, CBS_DROPDOWNLIST, CBN_CLOSEUP, CBN_DROPDOWN,
+    ShowWindow, IsWindow, IsWindowVisible, SW_HIDE, WM_CLOSE,
+    GetSystemMetrics, LoadImageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED,
+    SM_CXICON, SM_CYICON, SM_CXSMICON, SM_CYSMICON, WM_SETICON,
+    BN_CLICKED, BS_OWNERDRAW, CBS_DROPDOWNLIST, CBN_CLOSEUP, CBN_DROPDOWN,
     CBN_SELCHANGE, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CS_HREDRAW, CS_VREDRAW,
     GWLP_USERDATA, HICON, HMENU, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP,
     SB_THUMBPOSITION, SB_THUMBTRACK, SB_VERT, SCROLLINFO, SIF_ALL, SIF_PAGE, SIF_POS, SIF_RANGE,
-    STM_SETICON, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE,
+    STM_SETICON, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WINDOW_STYLE, WM_ACTIVATE,
     WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM,
     WM_ERASEBKGND, WM_HSCROLL, WM_KEYDOWN, WM_MOUSEWHEEL, WM_PAINT, WM_SETFONT, WM_VSCROLL,
-    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW,
+    WS_CAPTION, WS_SYSMENU, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::rules::{load_config_v3, save_config_v3};
@@ -289,7 +292,12 @@ pub fn calculate_flyout_position(width: i32, height: i32, tray_rect: Option<RECT
                 let cy = tr.top - height - 8;
                 (cx, cy)
             }
-            None => (pt.x - width / 2, pt.y - height - 8),
+            None => {
+                // Centered nicely on the active monitor screen
+                let cx = work.left + (work.right - work.left - width) / 2;
+                let cy = work.top + (work.bottom - work.top - height) / 2;
+                (cx, cy)
+            }
         };
 
         if x + width > work.right - margin {
@@ -323,6 +331,7 @@ pub fn ensure_common_controls() {
 /// Closes the current flyout if visible
 pub fn close_flyout() {
     let prev = CURRENT_FLYOUT.swap(0, Ordering::SeqCst);
+    crate::debug_log(&format!("close_flyout: prev={}", prev));
     if prev != 0 {
         unsafe {
             let _ = DestroyWindow(HWND(prev as _));
@@ -408,6 +417,37 @@ unsafe extern "system" fn container_wndproc(
 }
 
 /// Toggles the flyout window: closes if visible, otherwise creates and displays it
+
+fn load_app_icons(instance: windows::Win32::Foundation::HMODULE) -> (HICON, HICON) {
+    unsafe {
+        let ib = LoadImageW(
+            instance,
+            PCWSTR(1 as _),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON),
+            GetSystemMetrics(SM_CYICON),
+            LR_DEFAULTCOLOR | LR_SHARED,
+        );
+        let is = LoadImageW(
+            instance,
+            PCWSTR(1 as _),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_DEFAULTCOLOR | LR_SHARED,
+        );
+        let big = match ib {
+            Ok(h) if !h.is_invalid() => HICON(h.0),
+            _ => HICON::default(),
+        };
+        let small = match is {
+            Ok(h) if !h.is_invalid() => HICON(h.0),
+            _ => HICON::default(),
+        };
+        (big, small)
+    }
+}
+
 pub fn toggle_flyout(
     owner_hwnd: HWND,
     devices: Vec<DeviceItem>,
@@ -415,9 +455,20 @@ pub fn toggle_flyout(
     tray_rect: Option<RECT>,
 ) {
     let prev = CURRENT_FLYOUT.load(Ordering::SeqCst);
+    crate::debug_log(&format!("toggle_flyout: prev={}, apps={}, devices={}", prev, apps.len(), devices.len()));
     if prev != 0 {
+        let h = HWND(prev as _);
+        if unsafe { IsWindow(h) }.as_bool() {
+            let is_visible = unsafe { IsWindowVisible(h) }.as_bool();
+            if is_visible && tray_rect.is_some() {
+                crate::debug_log("toggle_flyout: hiding window on tray toggle click");
+                let _ = unsafe { ShowWindow(h, SW_HIDE) };
+                trim_background_memory();
+                return;
+            }
+        }
+        // Always recreate flyout to ensure freshly launched audio sessions are displayed
         close_flyout();
-        return;
     }
 
     ensure_common_controls();
@@ -449,6 +500,8 @@ pub fn toggle_flyout(
     unsafe {
         let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default();
 
+        let (icon_big, icon_small) = load_app_icons(instance);
+
         // Register Flyout window class
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -456,6 +509,8 @@ pub fn toggle_flyout(
             lpfnWndProc: Some(flyout_wndproc),
             hInstance: instance.into(),
             lpszClassName: class_name,
+            hIcon: icon_big,
+            hIconSm: icon_small,
             hbrBackground: CreateSolidBrush(COLORREF(0x001E1E1E)),
             ..Default::default()
         };
@@ -479,10 +534,10 @@ pub fn toggle_flyout(
         let (pos_x, pos_y) = calculate_flyout_position(dummy_width, dummy_height, tray_rect);
 
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            WS_EX_APPWINDOW,
             class_name,
-            w!("Audio Router Flyout"),
-            WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            w!("Audio Router - Quản lý âm thanh"),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
             pos_x,
             pos_y,
             dummy_width,
@@ -494,9 +549,22 @@ pub fn toggle_flyout(
         );
 
         let hwnd = match hwnd {
-            Ok(h) => h,
-            Err(_) => return,
+            Ok(h) => {
+                crate::debug_log(&format!("CreateWindowExW flyout success: {:?}", h));
+                h
+            }
+            Err(e) => {
+                crate::debug_log(&format!("CreateWindowExW flyout FAILED: {:?}", e));
+                return;
+            }
         };
+
+        if !icon_big.is_invalid() {
+            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_BIG as usize), LPARAM(icon_big.0 as isize));
+        }
+        if !icon_small.is_invalid() {
+            let _ = SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(icon_small.0 as isize));
+        }
 
         CURRENT_FLYOUT.store(hwnd.0 as usize, Ordering::SeqCst);
 
@@ -1081,10 +1149,11 @@ pub fn toggle_flyout(
 
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = UpdateWindow(hwnd);
-        let _ = SetForegroundWindow(hwnd);
-        let _ = SetFocus(hwnd);
+        let s_res = ShowWindow(hwnd, SW_SHOW);
+        let u_res = UpdateWindow(hwnd);
+        let f_res = SetForegroundWindow(hwnd);
+        let foc_res = SetFocus(hwnd);
+        crate::debug_log(&format!("ShowWindow: show={:?}, update={:?}, foreground={:?}, focus={:?}", s_res, u_res, f_res, foc_res));
     }
 }
 
@@ -1097,31 +1166,15 @@ unsafe extern "system" fn flyout_wndproc(
     let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut FlyoutState;
 
     match msg {
-        WM_ACTIVATE => {
-            let active_state = (wparam.0 as u32) & 0xFFFF;
-            if active_state == WA_INACTIVE as u32 {
-                let other_hwnd = HWND(lparam.0 as _);
-                if !other_hwnd.is_invalid() && !other_hwnd.0.is_null() {
-                    let mut target_pid = 0u32;
-                    unsafe {
-                        GetWindowThreadProcessId(other_hwnd, Some(&mut target_pid));
-                    }
-                    let current_pid = unsafe { GetCurrentProcessId() };
-                    if target_pid == current_pid {
-                        return LRESULT(0);
-                    }
-                }
+                WM_ACTIVATE => {
+            return LRESULT(0);
+        }
 
-                if !state_ptr.is_null() {
-                    let state = &*state_ptr;
-                    if state.is_dropdown_open {
-                        return LRESULT(0);
-                    }
-                }
-
-                close_flyout();
-                return LRESULT(0);
-            }
+        WM_CLOSE => {
+            crate::debug_log("flyout received WM_CLOSE: hiding window to tray");
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            trim_background_memory();
+            return LRESULT(0);
         }
 
         WM_KEYDOWN => {

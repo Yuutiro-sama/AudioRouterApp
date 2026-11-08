@@ -1,10 +1,14 @@
+<p align="center">
+  <img src="app_icon.png" width="128" height="128" alt="Audio Router App Icon" />
+</p>
+
 # Audio Router App 🎧 (v3.0.0)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-lightgrey.svg)](https://microsoft.com/windows)
 [![Rust](https://img.shields.io/badge/Rust-Native%20Win32%2FCOM%2FDSP-orange.svg)](https://www.rust-lang.org/)
-[![Binary Size](https://img.shields.io/badge/Binary-~455%20KB-success.svg)](#-ưu-điểm-nổi-bật)
-[![Memory Footprint](https://img.shields.io/badge/RAM-%3C%202.5%20MB-brightgreen.svg)](#-ưu-điểm-nổi-bật)
+[![Binary Size](https://img.shields.io/badge/Binary-~490%20KB-success.svg)](#-ưu-điểm-nổi-bật)
+[![Memory Footprint](https://img.shields.io/badge/RAM-%3C%205%20MB-brightgreen.svg)](#-ưu-điểm-nổi-bật)
 
 > [!NOTE]  
 > **Tuyên bố về AI và tính thương mại:**  
