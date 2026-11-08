@@ -8,6 +8,7 @@ use std::path::Path;
 use windows::core::{Interface, HSTRING};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, DEVICE_STATE_ACTIVE, IAudioSessionControl2,
     IAudioSessionManager2, IMMDevice, IMMDeviceCollection,
@@ -44,6 +45,12 @@ impl From<AudioDevice> for crate::ui::popup::DeviceItem {
         Self {
             id: d.id,
             name: d.name,
+            is_default: false,
+            is_enabled: false,
+            volume: 1.0,
+            is_muted: false,
+            latency_ms: 0.0,
+            drift_ppm: 0.0,
         }
     }
 }
@@ -371,6 +378,51 @@ pub fn set_app_mute(pid: u32, device_id: &str, mute: bool) -> windows::core::Res
         }
     }
     Ok(false)
+}
+
+/// Sets the master hardware/endpoint volume for a physical/virtual audio device.
+pub fn set_device_endpoint_volume(device_id: &str, volume: f32) -> windows::core::Result<bool> {
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let hstring_id = HSTRING::from(device_id);
+        let device = enumerator.GetDevice(&hstring_id)?;
+        if let Ok(endpoint_vol) = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
+            let clamped = volume.clamp(0.0, 1.0);
+            endpoint_vol.SetMasterVolumeLevelScalar(clamped, std::ptr::null())?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Sets the mute status on the hardware/endpoint of a physical/virtual audio device.
+pub fn set_device_endpoint_mute(device_id: &str, mute: bool) -> windows::core::Result<bool> {
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let hstring_id = HSTRING::from(device_id);
+        let device = enumerator.GetDevice(&hstring_id)?;
+        if let Ok(endpoint_vol) = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
+            endpoint_vol.SetMute(windows::Win32::Foundation::BOOL::from(mute), std::ptr::null())?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Gets the master hardware/endpoint volume and mute status for a device.
+pub fn get_device_endpoint_volume(device_id: &str) -> Option<(f32, bool)> {
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let hstring_id = HSTRING::from(device_id);
+        let device = enumerator.GetDevice(&hstring_id).ok()?;
+        let endpoint_vol = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok()?;
+        let vol = endpoint_vol.GetMasterVolumeLevelScalar().unwrap_or(1.0);
+        let mute = endpoint_vol.GetMute().map(|b| b.as_bool()).unwrap_or(false);
+        Some((vol, mute))
+    }
 }
 
 #[cfg(test)]

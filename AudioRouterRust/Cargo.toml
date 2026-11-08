@@ -1,6 +1,6 @@
 [package]
 name = "audio_router_rust"
-version = "1.0.0"
+version = "3.0.0"
 edition = "2021"
 
 [dependencies]
@@ -15,6 +15,7 @@ features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
+    "Win32_Media_Multimedia",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",

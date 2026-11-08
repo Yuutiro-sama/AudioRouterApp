@@ -1,3 +1,8 @@
+//! Win32 High-DPI Ephemeral Dark Flyout Window.
+//!
+//! Provides simultaneous multi-output selection, independent per-device volume sliders,
+//! and per-application routing & volume controls in Windows 11 Fluent Dark Mode style.
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -21,24 +26,33 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetCursorPos,
-    GetWindowLongPtrW, GetWindowThreadProcessId, PostMessageW, RegisterClassExW, SendMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    BN_CLICKED, BS_PUSHBUTTON, CBS_DROPDOWNLIST, CBN_CLOSEUP, CBN_DROPDOWN, CBN_SELCHANGE,
-    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HICON,
-    HMENU, STM_SETICON, SW_SHOW, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_COMMAND,
-    WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DESTROY, WM_HSCROLL, WM_KEYDOWN,
-    WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    GetDlgCtrlID, GetWindowLongPtrW, GetWindowThreadProcessId, KillTimer, PostMessageW,
+    RegisterClassExW, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, ShowWindow,
+    BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_PUSHBUTTON,
+    CBS_DROPDOWNLIST, CBN_CLOSEUP, CBN_DROPDOWN,
+    CBN_SELCHANGE, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CS_HREDRAW, CS_VREDRAW,
+    GWLP_USERDATA, HICON, HMENU, STM_SETICON, SW_SHOW, WA_INACTIVE, WINDOW_STYLE,
+    WM_ACTIVATE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC,
+    WM_DESTROY, WM_HSCROLL, WM_KEYDOWN, WM_SETFONT, WM_TIMER, WNDCLASSEXW,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 
-use crate::config::rules::{load_rules, save_rules};
+const BST_UNCHECKED: usize = 0;
+const BST_CHECKED: usize = 1;
+
+use crate::config::rules::{load_config_v3, save_config_v3};
 use crate::ipc_messages::WM_APP_APPLY_RULES;
 
 static CURRENT_FLYOUT: AtomicUsize = AtomicUsize::new(0);
 
 const TBM_GETPOS: u32 = 0x0400; // WM_USER
+const TIMER_ID_STATS: usize = 1;
+
 const SS_LEFT: WINDOW_STYLE = WINDOW_STYLE(0x00000000);
 const SS_CENTER: WINDOW_STYLE = WINDOW_STYLE(0x00000001);
+const SS_RIGHT: WINDOW_STYLE = WINDOW_STYLE(0x00000002);
 const SS_ICON: WINDOW_STYLE = WINDOW_STYLE(0x00000003);
 
 /// Trims the working set of the current process to aggressively release memory back to the OS (< 2.5 MB)
@@ -53,6 +67,27 @@ pub fn trim_background_memory() {
 pub struct DeviceItem {
     pub id: String,
     pub name: String,
+    pub is_default: bool,
+    pub is_enabled: bool,
+    pub volume: f32, // 0.0 .. 1.0
+    pub is_muted: bool,
+    pub latency_ms: f32,
+    pub drift_ppm: f32,
+}
+
+impl DeviceItem {
+    pub fn new(id: String, name: String) -> Self {
+        Self {
+            id,
+            name,
+            is_default: false,
+            is_enabled: false,
+            volume: 1.0,
+            is_muted: false,
+            latency_ms: 0.0,
+            drift_ppm: 0.0,
+        }
+    }
 }
 
 /// Item representing an active audio application session
@@ -64,6 +99,15 @@ pub struct AppAudioItem {
     pub current_device_id: String,
     pub volume: f32, // 0.0 .. 1.0
     pub is_muted: bool,
+}
+
+struct DeviceControlBinding {
+    device_index: usize,
+    chk_hwnd: HWND,
+    badge_hwnd: HWND,
+    mute_hwnd: HWND,
+    slider_hwnd: HWND,
+    percent_hwnd: HWND,
 }
 
 struct AppControlBinding {
@@ -82,10 +126,12 @@ struct FlyoutState {
     bg_brush: HBRUSH,
     card_brush: HBRUSH,
     title_font: HFONT,
+    section_font: HFONT,
     app_font: HFONT,
     small_font: HFONT,
     is_dropdown_open: bool,
-    bindings: Vec<AppControlBinding>,
+    device_bindings: Vec<DeviceControlBinding>,
+    app_bindings: Vec<AppControlBinding>,
 }
 
 unsafe fn create_ui_font(height: i32, weight: i32) -> HFONT {
@@ -200,8 +246,8 @@ pub fn close_flyout() {
 /// Toggles the flyout window: closes if visible, otherwise creates and displays it
 pub fn toggle_flyout(
     owner_hwnd: HWND,
-    devices: Vec<DeviceItem>,
-    apps: Vec<AppAudioItem>,
+    mut devices: Vec<DeviceItem>,
+    mut apps: Vec<AppAudioItem>,
     tray_rect: Option<RECT>,
 ) {
     let prev = CURRENT_FLYOUT.load(Ordering::SeqCst);
@@ -212,6 +258,47 @@ pub fn toggle_flyout(
 
     ensure_common_controls();
 
+    // 1. Synchronize configuration and device states
+    let config = load_config_v3();
+    let default_dev_id = crate::audio::get_default_render_device()
+        .ok()
+        .flatten()
+        .map(|d| d.id);
+
+    for dev in &mut devices {
+        if let Some(ref def_id) = default_dev_id {
+            if &dev.id == def_id {
+                dev.is_default = true;
+            }
+        }
+        if config.enabled_devices.is_empty() && dev.is_default {
+            dev.is_enabled = true;
+        } else {
+            dev.is_enabled = config.is_device_enabled(&dev.id);
+        }
+
+        if let Some((vol, mute)) = crate::audio::get_device_endpoint_volume(&dev.id) {
+            dev.volume = vol;
+            dev.is_muted = mute;
+        } else {
+            dev.volume = config.get_device_volume(&dev.id);
+            dev.is_muted = config.is_device_muted(&dev.id);
+        }
+    }
+
+    for app in &mut apps {
+        if let Some(rule) = config.get_app_rule(&app.name) {
+            if rule == "multi" {
+                app.current_device_id = "multi".to_string();
+            } else if !rule.is_empty() {
+                app.current_device_id = rule.clone();
+            }
+        }
+        if config.is_app_muted(&app.name) {
+            app.is_muted = true;
+        }
+    }
+
     let class_name = w!("AudioRouterFlyoutClass");
     unsafe {
         let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default();
@@ -221,14 +308,14 @@ pub fn toggle_flyout(
             lpfnWndProc: Some(flyout_wndproc),
             hInstance: instance.into(),
             lpszClassName: class_name,
-            hbrBackground: CreateSolidBrush(COLORREF(0x001F1F1F)),
+            hbrBackground: CreateSolidBrush(COLORREF(0x001E1E1E)),
             ..Default::default()
         };
         let _ = RegisterClassExW(&wc);
 
-        // Preliminary window to determine DPI
-        let dummy_width = 380;
-        let dummy_height = 200;
+        // Preliminary window to determine monitor DPI
+        let dummy_width = 420;
+        let dummy_height = 300;
         let (pos_x, pos_y) = calculate_flyout_position(dummy_width, dummy_height, tray_rect);
 
         let hwnd = CreateWindowExW(
@@ -240,7 +327,7 @@ pub fn toggle_flyout(
             pos_y,
             dummy_width,
             dummy_height,
-            HWND::default(), // Independent top-level window so owner doesn't interfere with focus
+            HWND::default(),
             HMENU::default(),
             instance,
             None,
@@ -253,7 +340,7 @@ pub fn toggle_flyout(
 
         CURRENT_FLYOUT.store(hwnd.0 as usize, Ordering::SeqCst);
 
-        // Windows 11 DWM attributes: Rounded corners and Dark Mode
+        // Windows 11 DWM attributes: Rounded corners and Immersive Dark Mode
         let corner_pref = DWMWCP_ROUND.0;
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -273,17 +360,22 @@ pub fn toggle_flyout(
         let dpi = GetDpiForWindow(hwnd);
         let scale = if dpi == 0 { 1.0f32 } else { dpi as f32 / 96.0f32 };
 
-        let width = (380.0 * scale) as i32;
+        let width = (420.0 * scale) as i32;
         let pad = (12.0 * scale) as i32;
         let title_h = (28.0 * scale) as i32;
-        let card_h = (88.0 * scale) as i32;
+        let sec_h = (22.0 * scale) as i32;
+        let dev_row_h = (52.0 * scale) as i32;
+        let app_card_h = (82.0 * scale) as i32;
 
-        let total_height = if apps.is_empty() {
-            (140.0 * scale) as i32
+        let dev_section_h = sec_h + (devices.len().max(1) as i32 * dev_row_h) + (8.0 * scale) as i32;
+        let app_section_h = if apps.is_empty() {
+            sec_h + (52.0 * scale) as i32
         } else {
-            let content_h = title_h + pad + (apps.len() as i32 * (card_h + pad / 2)) + pad;
-            content_h.min((560.0 * scale) as i32)
+            sec_h + (apps.len() as i32 * (app_card_h + pad / 3)) + pad
         };
+
+        let calculated_height = title_h + pad * 2 + dev_section_h + app_section_h + (12.0 * scale) as i32;
+        let total_height = calculated_height.min((680.0 * scale) as i32);
 
         let (final_x, final_y) = calculate_flyout_position(width, total_height, tray_rect);
         let _ = SetWindowPos(
@@ -297,18 +389,19 @@ pub fn toggle_flyout(
         );
 
         // Fonts
-        let title_font = create_ui_font((18.0 * scale) as i32, 600);
-        let app_font = create_ui_font((14.0 * scale) as i32, 600);
-        let small_font = create_ui_font((12.0 * scale) as i32, 400);
+        let title_font = create_ui_font((16.0 * scale) as i32, 700);
+        let section_font = create_ui_font((12.0 * scale) as i32, 600);
+        let app_font = create_ui_font((13.0 * scale) as i32, 600);
+        let small_font = create_ui_font((11.0 * scale) as i32, 400);
 
-        let bg_brush = CreateSolidBrush(COLORREF(0x001F1F1F));
+        let bg_brush = CreateSolidBrush(COLORREF(0x001E1E1E));
         let card_brush = CreateSolidBrush(COLORREF(0x002B2B2B));
 
-        // Create Header Title Label
-        let title_hwnd = CreateWindowExW(
+        // 1. Header Title: AUDIO ROUTER v3.0.0
+        let title_ctrl = CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
             w!("STATIC"),
-            w!("Audio Router"),
+            w!("AUDIO ROUTER v3.0.0 - MULTI-OUTPUT ENGINE"),
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             pad,
             pad,
@@ -319,40 +412,249 @@ pub fn toggle_flyout(
             instance,
             None,
         );
-        if let Ok(th) = title_hwnd {
+        if let Ok(th) = title_ctrl {
             let _ = SendMessageW(th, WM_SETFONT, WPARAM(title_font.0 as usize), LPARAM(1));
         }
 
-        let mut bindings = Vec::new();
-        let mut cur_y = pad + title_h + (6.0 * scale) as i32;
+        let mut cur_y = pad + title_h + (4.0 * scale) as i32;
 
-        if apps.is_empty() {
-            let empty_hwnd = CreateWindowExW(
+        // 2. SECTION 1: ĐA THIẾT BỊ ĐẦU RA (MULTI-OUTPUT SELECTION)
+        let sec1_ctrl = CreateWindowExW(
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!("ĐA THIẾT BỊ ĐẦU RA (PHÁT ĐỒNG THỜI)"),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            pad,
+            cur_y,
+            width - pad * 2,
+            sec_h,
+            hwnd,
+            HMENU(500 as _),
+            instance,
+            None,
+        );
+        if let Ok(sh) = sec1_ctrl {
+            let _ = SendMessageW(sh, WM_SETFONT, WPARAM(section_font.0 as usize), LPARAM(1));
+        }
+        cur_y += sec_h + (2.0 * scale) as i32;
+
+        let mut device_bindings = Vec::new();
+
+        if devices.is_empty() {
+            let no_dev_ctrl = CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
-                w!("Chưa có app nào đang có phiên âm thanh.\nHãy mở nhạc hoặc game rồi bấm lại icon."),
-                WS_CHILD | WS_VISIBLE | SS_CENTER,
-                pad,
-                cur_y + (16.0 * scale) as i32,
+                w!("Không tìm thấy thiết bị âm thanh đầu ra khả dụng."),
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
+                pad + (8.0 * scale) as i32,
+                cur_y,
                 width - pad * 2,
-                (48.0 * scale) as i32,
+                (24.0 * scale) as i32,
                 hwnd,
                 HMENU::default(),
                 instance,
                 None,
             );
-            if let Ok(eh) = empty_hwnd {
-                let _ = SendMessageW(eh, WM_SETFONT, WPARAM(app_font.0 as usize), LPARAM(1));
+            if let Ok(nh) = no_dev_ctrl {
+                let _ = SendMessageW(nh, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
+            }
+            cur_y += (28.0 * scale) as i32;
+        } else {
+            for (i, dev) in devices.iter().enumerate() {
+                let row_y = cur_y;
+                let base_id = 1000 + i * 10;
+                let content_w = width - pad * 2;
+
+                // Line 1: Checkbox + Device Name
+                let chk_w = content_w - (140.0 * scale) as i32;
+                let dev_name_wide: Vec<u16> = dev.name.encode_utf16().chain(std::iter::once(0)).collect();
+                let chk_ctrl = CreateWindowExW(
+                    windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+                    w!("BUTTON"),
+                    PCWSTR(dev_name_wide.as_ptr()),
+                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+                    pad + (4.0 * scale) as i32,
+                    row_y,
+                    chk_w,
+                    (22.0 * scale) as i32,
+                    hwnd,
+                    HMENU(base_id as _),
+                    instance,
+                    None,
+                );
+                let chk_hwnd = chk_ctrl.unwrap_or_default();
+                let _ = SendMessageW(chk_hwnd, WM_SETFONT, WPARAM(app_font.0 as usize), LPARAM(1));
+                let chk_val = if dev.is_enabled { BST_CHECKED as isize } else { BST_UNCHECKED as isize };
+                let _ = SendMessageW(chk_hwnd, BM_SETCHECK, WPARAM(chk_val as usize), LPARAM(0));
+
+                // Line 1 Right: Badge [Chính] / [Đang phát] / [Tắt] + Latency/Drift
+                let badge_x = pad + (4.0 * scale) as i32 + chk_w;
+                let badge_w = (136.0 * scale) as i32;
+                let badge_str = if dev.is_enabled {
+                    if dev.is_default {
+                        "[Chính • 0.0 ms]".to_string()
+                    } else if dev.latency_ms > 0.0 {
+                        format!("[Đang phát • {:.1}ms | {:+.0}ppm]", dev.latency_ms, dev.drift_ppm)
+                    } else {
+                        "[Đang phát]".to_string()
+                    }
+                } else {
+                    "[Tắt]".to_string()
+                };
+                let badge_wide: Vec<u16> = badge_str.encode_utf16().chain(std::iter::once(0)).collect();
+                let badge_ctrl = CreateWindowExW(
+                    windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    PCWSTR(badge_wide.as_ptr()),
+                    WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                    badge_x,
+                    row_y + 2,
+                    badge_w,
+                    (20.0 * scale) as i32,
+                    hwnd,
+                    HMENU((base_id + 1) as _),
+                    instance,
+                    None,
+                );
+                let badge_hwnd = badge_ctrl.unwrap_or_default();
+                let _ = SendMessageW(badge_hwnd, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
+
+                // Line 2: Mute Button + Trackbar Slider + Percent Label
+                let line2_y = row_y + (24.0 * scale) as i32;
+                let btn_w = (48.0 * scale) as i32;
+                let pct_w = (38.0 * scale) as i32;
+                let slider_w = content_w - btn_w - pct_w - (16.0 * scale) as i32;
+
+                // Mute button
+                let mute_text = if dev.is_muted { w!("Bật") } else { w!("Tắt") };
+                let mute_ctrl = CreateWindowExW(
+                    windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+                    w!("BUTTON"),
+                    mute_text,
+                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+                    pad + (12.0 * scale) as i32,
+                    line2_y,
+                    btn_w,
+                    (22.0 * scale) as i32,
+                    hwnd,
+                    HMENU((base_id + 2) as _),
+                    instance,
+                    None,
+                );
+                let mute_hwnd = mute_ctrl.unwrap_or_default();
+                let _ = SendMessageW(mute_hwnd, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
+
+                // Trackbar slider
+                let slider_x = pad + (12.0 * scale) as i32 + btn_w + (6.0 * scale) as i32;
+                let slider_ctrl = CreateWindowExW(
+                    windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+                    w!("msctls_trackbar32"),
+                    PCWSTR::null(),
+                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(TBS_HORZ as u32 | TBS_AUTOTICKS as u32),
+                    slider_x,
+                    line2_y,
+                    slider_w,
+                    (22.0 * scale) as i32,
+                    hwnd,
+                    HMENU((base_id + 3) as _),
+                    instance,
+                    None,
+                );
+                let slider_hwnd = slider_ctrl.unwrap_or_default();
+                let _ = SendMessageW(
+                    slider_hwnd,
+                    TBM_SETRANGE,
+                    WPARAM(1),
+                    LPARAM(((100u32 << 16) | 0u32) as isize),
+                );
+                let vol_val = (dev.volume * 100.0).clamp(0.0, 100.0) as u32;
+                let _ = SendMessageW(slider_hwnd, TBM_SETPOS, WPARAM(1), LPARAM(vol_val as isize));
+
+                // Percent label
+                let pct_x = slider_x + slider_w + (4.0 * scale) as i32;
+                let pct_str = format!("{}%", vol_val);
+                let pct_wide: Vec<u16> = pct_str.encode_utf16().chain(std::iter::once(0)).collect();
+                let pct_ctrl = CreateWindowExW(
+                    windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    PCWSTR(pct_wide.as_ptr()),
+                    WS_CHILD | WS_VISIBLE | SS_CENTER,
+                    pct_x,
+                    line2_y + 2,
+                    pct_w,
+                    (20.0 * scale) as i32,
+                    hwnd,
+                    HMENU((base_id + 4) as _),
+                    instance,
+                    None,
+                );
+                let percent_hwnd = pct_ctrl.unwrap_or_default();
+                let _ = SendMessageW(percent_hwnd, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
+
+                device_bindings.push(DeviceControlBinding {
+                    device_index: i,
+                    chk_hwnd,
+                    badge_hwnd,
+                    mute_hwnd,
+                    slider_hwnd,
+                    percent_hwnd,
+                });
+
+                cur_y += dev_row_h;
+            }
+        }
+
+        cur_y += (6.0 * scale) as i32;
+
+        // 3. SECTION 2: DANH SÁCH ỨNG DỤNG ĐANG PHÁT (ACTIVE SESSIONS)
+        let sec2_ctrl = CreateWindowExW(
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!("ÂM LƯỢNG & ĐỊNH TUYẾN TỪNG ỨNG DỤNG (ACTIVE SESSIONS)"),
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            pad,
+            cur_y,
+            width - pad * 2,
+            sec_h,
+            hwnd,
+            HMENU(501 as _),
+            instance,
+            None,
+        );
+        if let Ok(sh) = sec2_ctrl {
+            let _ = SendMessageW(sh, WM_SETFONT, WPARAM(section_font.0 as usize), LPARAM(1));
+        }
+        cur_y += sec_h + (4.0 * scale) as i32;
+
+        let mut app_bindings = Vec::new();
+
+        if apps.is_empty() {
+            let empty_ctrl = CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("Chưa có ứng dụng nào phát âm thanh.\nHãy mở nhạc, video hoặc game rồi bấm lại icon."),
+                WS_CHILD | WS_VISIBLE | SS_CENTER,
+                pad,
+                cur_y + (8.0 * scale) as i32,
+                width - pad * 2,
+                (42.0 * scale) as i32,
+                hwnd,
+                HMENU::default(),
+                instance,
+                None,
+            );
+            if let Ok(eh) = empty_ctrl {
+                let _ = SendMessageW(eh, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
             }
         } else {
             for (i, app) in apps.iter().enumerate() {
                 let card_y = cur_y;
                 let card_w = width - pad * 2;
-                let base_id = 1000 + i * 10;
+                let base_id = 2000 + i * 10;
 
                 // App icon
                 let icon = load_app_icon(app.exe_path.as_deref());
-                let icon_size = (28.0 * scale) as i32;
+                let icon_size = (24.0 * scale) as i32;
 
                 if let Some(hicon) = icon {
                     let icon_ctrl = CreateWindowExW(
@@ -374,10 +676,11 @@ pub fn toggle_flyout(
                     }
                 }
 
-                // App Name
+                // App Name Label
                 let name_x = pad + icon_size + (8.0 * scale) as i32;
                 let name_w = card_w - (icon_size + (8.0 * scale) as i32) - 4;
-                let name_wide: Vec<u16> = app.name.encode_utf16().chain(std::iter::once(0)).collect();
+                let name_display = format!("{} (PID: {})", app.name, app.pid);
+                let name_wide: Vec<u16> = name_display.encode_utf16().chain(std::iter::once(0)).collect();
                 let name_ctrl = CreateWindowExW(
                     windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
                     w!("STATIC"),
@@ -396,8 +699,8 @@ pub fn toggle_flyout(
                     let _ = SendMessageW(nh, WM_SETFONT, WPARAM(app_font.0 as usize), LPARAM(1));
                 }
 
-                // ComboBox: Device selection
-                let combo_y = card_y + (28.0 * scale) as i32;
+                // ComboBox: Route selection ("Phát Đa Đầu Ra" or pin to specific device)
+                let combo_y = card_y + (26.0 * scale) as i32;
                 let combo_h = (26.0 * scale) as i32;
                 let combo_ctrl = CreateWindowExW(
                     windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
@@ -407,39 +710,47 @@ pub fn toggle_flyout(
                     pad + 4,
                     combo_y,
                     card_w - 8,
-                    (200.0 * scale) as i32,
+                    (220.0 * scale) as i32,
                     hwnd,
                     HMENU((base_id + 2) as _),
                     instance,
                     None,
                 );
-
                 let combo_hwnd = combo_ctrl.unwrap_or_default();
                 let _ = SendMessageW(combo_hwnd, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
 
-                // Populate devices in ComboBox
+                // Populate ComboBox options
+                // Item 0: Multi-Output mode
+                let multi_str = w!("🔊 Phát Đa Đầu Ra (Mặc định)");
+                let _ = SendMessageW(combo_hwnd, CB_ADDSTRING, WPARAM(0), LPARAM(multi_str.as_ptr() as _));
+
                 let mut selected_idx = 0;
+                let is_explicit_multi = app.current_device_id == "multi"
+                    || config.get_app_rule(&app.name).map_or(false, |r| r == "multi");
+
                 for (dev_idx, dev) in devices.iter().enumerate() {
-                    let dev_wide: Vec<u16> = dev.name.encode_utf16().chain(std::iter::once(0)).collect();
+                    let opt_name = format!("Ghim: {}", dev.name);
+                    let opt_wide: Vec<u16> = opt_name.encode_utf16().chain(std::iter::once(0)).collect();
                     let _ = SendMessageW(
                         combo_hwnd,
                         CB_ADDSTRING,
                         WPARAM(0),
-                        LPARAM(dev_wide.as_ptr() as _),
+                        LPARAM(opt_wide.as_ptr() as _),
                     );
-                    if dev.id == app.current_device_id {
-                        selected_idx = dev_idx;
+
+                    if !is_explicit_multi && dev.id == app.current_device_id {
+                        selected_idx = dev_idx + 1;
                     }
                 }
                 let _ = SendMessageW(combo_hwnd, CB_SETCURSEL, WPARAM(selected_idx), LPARAM(0));
 
                 // Row 3: Mute button, Slider trackbar, Volume percent
                 let row3_y = combo_y + combo_h + (4.0 * scale) as i32;
-                let btn_w = (54.0 * scale) as i32;
+                let btn_w = (48.0 * scale) as i32;
                 let pct_w = (38.0 * scale) as i32;
                 let slider_w = card_w - btn_w - pct_w - (16.0 * scale) as i32;
 
-                // Mute Button
+                // Mute button
                 let mute_text = if app.is_muted { w!("Bật") } else { w!("Tắt") };
                 let mute_ctrl = CreateWindowExW(
                     windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
@@ -458,7 +769,7 @@ pub fn toggle_flyout(
                 let mute_hwnd = mute_ctrl.unwrap_or_default();
                 let _ = SendMessageW(mute_hwnd, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
 
-                // Slider Trackbar
+                // Slider trackbar
                 let slider_x = pad + 4 + btn_w + (4.0 * scale) as i32;
                 let slider_ctrl = CreateWindowExW(
                     windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
@@ -484,7 +795,7 @@ pub fn toggle_flyout(
                 let vol_val = (app.volume * 100.0).clamp(0.0, 100.0) as u32;
                 let _ = SendMessageW(slider_hwnd, TBM_SETPOS, WPARAM(1), LPARAM(vol_val as isize));
 
-                // Percent Label
+                // Percent label
                 let pct_x = slider_x + slider_w + (4.0 * scale) as i32;
                 let pct_str = format!("{}%", vol_val);
                 let pct_wide: Vec<u16> = pct_str.encode_utf16().chain(std::iter::once(0)).collect();
@@ -505,7 +816,7 @@ pub fn toggle_flyout(
                 let percent_hwnd = pct_ctrl.unwrap_or_default();
                 let _ = SendMessageW(percent_hwnd, WM_SETFONT, WPARAM(small_font.0 as usize), LPARAM(1));
 
-                bindings.push(AppControlBinding {
+                app_bindings.push(AppControlBinding {
                     app_index: i,
                     combo_hwnd,
                     mute_hwnd,
@@ -514,9 +825,12 @@ pub fn toggle_flyout(
                     icon,
                 });
 
-                cur_y += card_h + (pad / 2);
+                cur_y += app_card_h + (pad / 3);
             }
         }
+
+        // Timer for real-time stats (latency, clock drift)
+        let _ = SetTimer(hwnd, TIMER_ID_STATS, 250, None);
 
         let state = Box::new(FlyoutState {
             owner_hwnd,
@@ -525,10 +839,12 @@ pub fn toggle_flyout(
             bg_brush,
             card_brush,
             title_font,
+            section_font,
             app_font,
             small_font,
             is_dropdown_open: false,
-            bindings,
+            device_bindings,
+            app_bindings,
         });
 
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
@@ -560,7 +876,7 @@ unsafe extern "system" fn flyout_wndproc(
                     }
                     let current_pid = unsafe { GetCurrentProcessId() };
                     if target_pid == current_pid {
-                        // Focus is inside our own window or child control (e.g. ComboBox dropdown, slider, button)!
+                        // Focus is inside our own window or child control (e.g. ComboBox dropdown, slider, button)
                         return LRESULT(0);
                     }
                 }
@@ -594,15 +910,46 @@ unsafe extern "system" fn flyout_wndproc(
                 } else if notify_code == CBN_CLOSEUP as u32 {
                     state.is_dropdown_open = false;
                 } else if notify_code == CBN_SELCHANGE as u32 {
-                    for b in &state.bindings {
+                    // App routing ComboBox changed
+                    for b in &state.app_bindings {
                         if b.combo_hwnd.0 as isize == lparam.0 {
                             let sel = SendMessageW(b.combo_hwnd, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as usize;
-                            if sel < state.devices.len() {
-                                let dev = &state.devices[sel];
-                                let app = &mut state.apps[b.app_index];
-                                app.current_device_id = dev.id.clone();
+                            let app = &mut state.apps[b.app_index];
+                            let mut config = load_config_v3();
 
-                                // 1. Apply routing immediately and synchronously for this PID and all sibling PIDs
+                            if sel == 0 {
+                                // "Phát Đa Đầu Ra" selected
+                                app.current_device_id = "multi".to_string();
+                                config.set_app_rule(app.name.clone(), "multi".into());
+                                let _ = save_config_v3(&config);
+
+                                // Reset app policy route to default so loopback picks it up
+                                if let Ok(factory) = crate::audio::policy_config::get_policy_config_factory() {
+                                    let _ = crate::audio::policy_config::set_app_output_device(
+                                        &factory,
+                                        app.pid,
+                                        windows::Win32::Media::Audio::eRender,
+                                        None,
+                                    );
+                                    let sibling_pids = crate::audio::enumerator::get_pids_by_process_name(&app.name);
+                                    for pid in sibling_pids {
+                                        if pid != app.pid {
+                                            let _ = crate::audio::policy_config::set_app_output_device(
+                                                &factory,
+                                                pid,
+                                                windows::Win32::Media::Audio::eRender,
+                                                None,
+                                            );
+                                        }
+                                    }
+                                }
+                            } else if sel - 1 < state.devices.len() {
+                                // Specific device pinned
+                                let dev = &state.devices[sel - 1];
+                                app.current_device_id = dev.id.clone();
+                                config.set_app_rule(app.name.clone(), dev.id.clone());
+                                let _ = save_config_v3(&config);
+
                                 if let Ok(factory) = crate::audio::policy_config::get_policy_config_factory() {
                                     let _ = crate::audio::policy_config::set_app_output_device(
                                         &factory,
@@ -622,25 +969,73 @@ unsafe extern "system" fn flyout_wndproc(
                                         }
                                     }
                                 }
-
-                                // 2. Save rule to %AppData%\AudioRouter\rules.json
-                                let mut rules = load_rules();
-                                rules.insert(app.name.clone(), dev.id.clone());
-                                let _ = save_rules(&rules);
-
-                                // 3. Notify owner window to trigger background state update
-                                let _ = PostMessageW(
-                                    state.owner_hwnd,
-                                    WM_APP_APPLY_RULES,
-                                    WPARAM(app.pid as usize),
-                                    LPARAM(0),
-                                );
                             }
+
+                            let _ = PostMessageW(
+                                state.owner_hwnd,
+                                WM_APP_APPLY_RULES,
+                                WPARAM(app.pid as usize),
+                                LPARAM(0),
+                            );
                             break;
                         }
                     }
                 } else if notify_code == BN_CLICKED as u32 {
-                    for b in &mut state.bindings {
+                    // Check if it is a Device Checkbox
+                    for b in &mut state.device_bindings {
+                        if b.chk_hwnd.0 as isize == lparam.0 {
+                            let is_checked = SendMessageW(b.chk_hwnd, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
+                                == BST_CHECKED as isize;
+                            let dev = &mut state.devices[b.device_index];
+                            dev.is_enabled = is_checked;
+
+                            // Update badge text
+                            let badge_str = if dev.is_enabled {
+                                if dev.is_default {
+                                    "[Chính • 0.0 ms]".to_string()
+                                } else if dev.latency_ms > 0.0 {
+                                    format!("[Đang phát • {:.1}ms | {:+.0}ppm]", dev.latency_ms, dev.drift_ppm)
+                                } else {
+                                    "[Đang phát]".to_string()
+                                }
+                            } else {
+                                "[Tắt]".to_string()
+                            };
+                            let badge_wide: Vec<u16> = badge_str.encode_utf16().chain(std::iter::once(0)).collect();
+                            let _ = SetWindowTextW(b.badge_hwnd, PCWSTR(badge_wide.as_ptr()));
+
+                            // Persist to ConfigV3
+                            let mut config = load_config_v3();
+                            config.set_device_enabled(dev.id.clone(), is_checked);
+                            let _ = save_config_v3(&config);
+
+                            // Notify application dispatcher
+                            let _ = PostMessageW(state.owner_hwnd, WM_APP_APPLY_RULES, WPARAM(0), LPARAM(0));
+                            return LRESULT(0);
+                        }
+                    }
+
+                    // Check if it is a Device Mute Button
+                    for b in &mut state.device_bindings {
+                        if b.mute_hwnd.0 as isize == lparam.0 {
+                            let dev = &mut state.devices[b.device_index];
+                            dev.is_muted = !dev.is_muted;
+                            let new_text = if dev.is_muted { w!("Bật") } else { w!("Tắt") };
+                            let _ = SetWindowTextW(b.mute_hwnd, new_text);
+
+                            // Apply hardware endpoint mute
+                            let _ = crate::audio::set_device_endpoint_mute(&dev.id, dev.is_muted);
+
+                            // Persist to ConfigV3
+                            let mut config = load_config_v3();
+                            config.set_device_mute(dev.id.clone(), dev.is_muted);
+                            let _ = save_config_v3(&config);
+                            return LRESULT(0);
+                        }
+                    }
+
+                    // Check if it is an App Mute Button
+                    for b in &mut state.app_bindings {
                         if b.mute_hwnd.0 as isize == lparam.0 {
                             let app = &mut state.apps[b.app_index];
                             app.is_muted = !app.is_muted;
@@ -650,13 +1045,18 @@ unsafe extern "system" fn flyout_wndproc(
                             // Set mute in Windows Core Audio
                             let _ = crate::audio::set_app_mute(app.pid, &app.current_device_id, app.is_muted);
 
+                            // Persist to ConfigV3
+                            let mut config = load_config_v3();
+                            config.set_app_mute(app.name.clone(), app.is_muted);
+                            let _ = save_config_v3(&config);
+
                             let _ = PostMessageW(
                                 state.owner_hwnd,
                                 WM_APP_APPLY_RULES,
                                 WPARAM(app.pid as usize),
                                 LPARAM(if app.is_muted { 1 } else { 0 }),
                             );
-                            break;
+                            return LRESULT(0);
                         }
                     }
                 }
@@ -667,7 +1067,32 @@ unsafe extern "system" fn flyout_wndproc(
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
                 let slider_hwnd = HWND(lparam.0 as _);
-                for b in &mut state.bindings {
+
+                // 1. Device Volume Slider
+                for b in &mut state.device_bindings {
+                    if b.slider_hwnd == slider_hwnd {
+                        let pos = SendMessageW(slider_hwnd, TBM_GETPOS, WPARAM(0), LPARAM(0)).0 as u32;
+                        let dev = &mut state.devices[b.device_index];
+                        let new_vol = pos as f32 / 100.0;
+                        dev.volume = new_vol;
+
+                        let text = format!("{}%", pos);
+                        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+                        let _ = SetWindowTextW(b.percent_hwnd, PCWSTR(wide.as_ptr()));
+
+                        // Zero-zipper hardware volume adjustment
+                        let _ = crate::audio::set_device_endpoint_volume(&dev.id, new_vol);
+
+                        // Persist to ConfigV3
+                        let mut config = load_config_v3();
+                        config.set_device_volume(dev.id.clone(), new_vol);
+                        let _ = save_config_v3(&config);
+                        return LRESULT(0);
+                    }
+                }
+
+                // 2. App Volume Slider
+                for b in &mut state.app_bindings {
                     if b.slider_hwnd == slider_hwnd {
                         let pos = SendMessageW(slider_hwnd, TBM_GETPOS, WPARAM(0), LPARAM(0)).0 as u32;
                         let app = &mut state.apps[b.app_index];
@@ -680,9 +1105,38 @@ unsafe extern "system" fn flyout_wndproc(
 
                         // Set volume in Windows Core Audio
                         let _ = crate::audio::set_app_volume(app.pid, &app.current_device_id, new_vol);
-                        break;
+
+                        // Persist to ConfigV3
+                        let mut config = load_config_v3();
+                        config.set_app_volume(app.name.clone(), new_vol);
+                        let _ = save_config_v3(&config);
+                        return LRESULT(0);
                     }
                 }
+            }
+        }
+
+        WM_TIMER => {
+            if wparam.0 == TIMER_ID_STATS && !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                // Periodic refresh of device badges (latency, drift)
+                for b in &state.device_bindings {
+                    let dev = &state.devices[b.device_index];
+                    let badge_str = if dev.is_enabled {
+                        if dev.is_default {
+                            "[Chính • 0.0 ms]".to_string()
+                        } else if dev.latency_ms > 0.0 {
+                            format!("[Đang phát • {:.1}ms | {:+.0}ppm]", dev.latency_ms, dev.drift_ppm)
+                        } else {
+                            "[Đang phát]".to_string()
+                        }
+                    } else {
+                        "[Tắt]".to_string()
+                    };
+                    let badge_wide: Vec<u16> = badge_str.encode_utf16().chain(std::iter::once(0)).collect();
+                    let _ = SetWindowTextW(b.badge_hwnd, PCWSTR(badge_wide.as_ptr()));
+                }
+                return LRESULT(0);
             }
         }
 
@@ -690,14 +1144,26 @@ unsafe extern "system" fn flyout_wndproc(
             if !state_ptr.is_null() {
                 let state = &*state_ptr;
                 let hdc = HDC(wparam.0 as _);
-                let _ = SetTextColor(hdc, COLORREF(0x00FFFFFF)); // White text
-                let _ = SetBkColor(hdc, COLORREF(0x001F1F1F));  // Dark background
+                let ctrl_id = GetDlgCtrlID(HWND(lparam.0 as _));
+
+                if ctrl_id == 500 || ctrl_id == 501 {
+                    // Section Headers: Cyan Accent (#60CDFF -> BBGGRR: 0x00FFCD60)
+                    let _ = SetTextColor(hdc, COLORREF(0x00FFCD60));
+                } else if ctrl_id >= 1000 && ctrl_id < 2000 && (ctrl_id % 10 == 1) {
+                    // Device status badges: Mint Green (#00E676 -> BBGGRR: 0x0076E600)
+                    let _ = SetTextColor(hdc, COLORREF(0x0076E600));
+                } else {
+                    let _ = SetTextColor(hdc, COLORREF(0x00FFFFFF)); // White text
+                }
+
+                let _ = SetBkColor(hdc, COLORREF(0x001E1E1E));  // Dark background
                 let _ = SetBkMode(hdc, TRANSPARENT);
                 return LRESULT(state.bg_brush.0 as isize);
             }
         }
 
         WM_DESTROY => {
+            let _ = KillTimer(hwnd, TIMER_ID_STATS);
             if !state_ptr.is_null() {
                 let state = Box::from_raw(state_ptr);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -705,10 +1171,11 @@ unsafe extern "system" fn flyout_wndproc(
                 let _ = DeleteObject(state.bg_brush);
                 let _ = DeleteObject(state.card_brush);
                 let _ = DeleteObject(state.title_font);
+                let _ = DeleteObject(state.section_font);
                 let _ = DeleteObject(state.app_font);
                 let _ = DeleteObject(state.small_font);
 
-                for b in &state.bindings {
+                for b in &state.app_bindings {
                     if let Some(icon) = b.icon {
                         let _ = DestroyIcon(icon);
                     }
@@ -725,7 +1192,6 @@ unsafe extern "system" fn flyout_wndproc(
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,8 +1202,17 @@ mod tests {
     }
 
     #[test]
+    fn test_device_item_creation() {
+        let dev = DeviceItem::new("dev_id".into(), "Headphones".into());
+        assert_eq!(dev.id, "dev_id");
+        assert_eq!(dev.name, "Headphones");
+        assert!(!dev.is_enabled);
+        assert_eq!(dev.volume, 1.0);
+    }
+
+    #[test]
     fn test_calculate_flyout_pos() {
-        let (x, y) = calculate_flyout_position(380, 200, None);
+        let (x, y) = calculate_flyout_position(420, 300, None);
         assert!(x >= 0);
         assert!(y >= 0);
 
@@ -747,7 +1222,7 @@ mod tests {
             right: 1740,
             bottom: 1080,
         };
-        let (x2, y2) = calculate_flyout_position(380, 200, Some(dummy_rect));
+        let (x2, y2) = calculate_flyout_position(420, 300, Some(dummy_rect));
         assert!(x2 > 0);
         assert!(y2 > 0);
     }

@@ -52,7 +52,7 @@ pub fn set_run_at_startup(enable: bool) -> Result<(), windows::core::Error> {
 
         let result = if enable {
             if let Ok(exe_path) = std::env::current_exe() {
-                let path_str = format!("\"{}\"", exe_path.display());
+                let path_str = format!("\"{}\" --tray", exe_path.display());
                 let wide: Vec<u16> = path_str.encode_utf16().chain(std::iter::once(0)).collect();
                 let bytes = std::slice::from_raw_parts(
                     wide.as_ptr() as *const u8,
@@ -153,7 +153,7 @@ pub fn create_speaker_icon() -> Result<HICON, windows::core::Error> {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: WIDTH as i32,
-                biHeight: -(HEIGHT as i32), // negative for top-down
+                biHeight: HEIGHT as i32, // standard bottom-up
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB.0,
@@ -173,14 +173,30 @@ pub fn create_speaker_icon() -> Result<HICON, windows::core::Error> {
         )?;
 
         if !bits.is_null() {
-            std::ptr::copy_nonoverlapping(
-                pixels.as_ptr(),
-                bits as *mut u32,
-                WIDTH * HEIGHT,
-            );
+            let dest_slice = std::slice::from_raw_parts_mut(bits as *mut u32, WIDTH * HEIGHT);
+            for y in 0..HEIGHT {
+                let src_row = y;
+                let dst_row = HEIGHT - 1 - y;
+                for x in 0..WIDTH {
+                    dest_slice[dst_row * WIDTH + x] = pixels[src_row * WIDTH + x];
+                }
+            }
         }
 
-        let mask_bytes = [0u8; (WIDTH * HEIGHT) / 8];
+        // Mask: 1bpp monochrome bitmap (1 = transparent, 0 = opaque)
+        let mut mask_bytes = [0u8; (WIDTH * HEIGHT) / 8];
+        for y in 0..HEIGHT {
+            let mask_row = HEIGHT - 1 - y;
+            for x in 0..WIDTH {
+                let pixel = pixels[y * WIDTH + x];
+                let alpha = (pixel >> 24) & 0xFF;
+                if alpha < 128 {
+                    let bit_offset = mask_row * WIDTH + x;
+                    mask_bytes[bit_offset / 8] |= 0x80 >> (bit_offset % 8);
+                }
+            }
+        }
+
         let hbm_mask = CreateBitmap(
             WIDTH as i32,
             HEIGHT as i32,

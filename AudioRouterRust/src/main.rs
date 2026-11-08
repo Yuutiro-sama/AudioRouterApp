@@ -3,7 +3,7 @@
 //! AudioRouterApp - High-Performance Native Rust Audio Router.
 //!
 //! Sub-3MB binary footprint and ultra-low RAM usage (< 2.5MB idle).
-//! Routes per-application audio streams to designated endpoints using Windows Core Audio & WinRT APIs.
+//! Multi-Output DSP Engine, per-application audio routing, independent device and app volume controls.
 
 pub mod app_state;
 pub mod audio;
@@ -33,13 +33,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::app_state::AppState;
-use crate::audio::enumerator::get_active_app_sessions;
 use crate::ipc_messages::{
     DEBOUNCE_DELAY_MS, IDM_APPLY_RULES, IDM_EXIT, IDM_SHOW_UI, IDM_STARTUP,
     TIMER_ID_DEBOUNCE, WM_APP_APPLY_RULES, WM_APP_DEFAULT_CHANGED,
     WM_APP_DEVICE_HOTPLUG, WM_APP_SESSION_CREATED, WM_APP_TRAY,
 };
-use crate::ui::popup::{close_flyout, toggle_flyout, AppAudioItem, DeviceItem};
+use crate::ui::popup::{close_flyout, toggle_flyout};
 use crate::ui::tray::{register_taskbar_created_message, TrayIcon};
 
 /// Context structure stored in the hidden dispatcher window's `GWLP_USERDATA`.
@@ -78,8 +77,8 @@ unsafe extern "system" fn dispatcher_wndproc(
     match msg {
         WM_APP_TRAY => {
             let event = (lparam.0 as u32) & 0xFFFF;
-            // Left click or notification select with 250ms debounce
-            if event == WM_LBUTTONUP || event == 0x0400 /* NIN_SELECT */ {
+            // Left click, button down, or notification select with 250ms debounce
+            if event == WM_LBUTTONUP || event == 0x0400 /* NIN_SELECT */ || event == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -90,13 +89,8 @@ unsafe extern "system" fn dispatcher_wndproc(
                 }
 
                 data.app_state.refresh_devices();
-                let device_items: Vec<DeviceItem> =
-                    data.app_state.devices.iter().cloned().map(Into::into).collect();
-                let app_items: Vec<AppAudioItem> =
-                    get_active_app_sessions(&data.app_state.devices)
-                        .into_iter()
-                        .map(Into::into)
-                        .collect();
+                let device_items = data.app_state.get_device_items();
+                let app_items = data.app_state.get_app_items();
                 let tray_rect = data.tray_icon.get_rect();
                 toggle_flyout(hwnd, device_items, app_items, tray_rect);
             } else if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
@@ -110,13 +104,8 @@ unsafe extern "system" fn dispatcher_wndproc(
             match cmd_id {
                 IDM_SHOW_UI => {
                     data.app_state.refresh_devices();
-                    let device_items: Vec<DeviceItem> =
-                        data.app_state.devices.iter().cloned().map(Into::into).collect();
-                    let app_items: Vec<AppAudioItem> =
-                        get_active_app_sessions(&data.app_state.devices)
-                            .into_iter()
-                            .map(Into::into)
-                            .collect();
+                    let device_items = data.app_state.get_device_items();
+                    let app_items = data.app_state.get_app_items();
                     let tray_rect = data.tray_icon.get_rect();
                     toggle_flyout(hwnd, device_items, app_items, tray_rect);
                     LRESULT(0)
@@ -124,6 +113,7 @@ unsafe extern "system" fn dispatcher_wndproc(
                 IDM_APPLY_RULES => {
                     data.app_state.refresh_devices();
                     data.app_state.reload_rules();
+                    data.app_state.sync_multi_engine();
                     let _ = data.app_state.apply_all_rules(true);
                     LRESULT(0)
                 }
@@ -161,6 +151,7 @@ unsafe extern "system" fn dispatcher_wndproc(
         WM_APP_APPLY_RULES => {
             let pid = wparam.0 as u32;
             data.app_state.reload_rules();
+            data.app_state.sync_multi_engine();
             if pid > 0 {
                 data.app_state.apply_rule_for_pid(pid);
             } else {
@@ -174,6 +165,7 @@ unsafe extern "system" fn dispatcher_wndproc(
                 let _ = KillTimer(hwnd, TIMER_ID_DEBOUNCE);
                 data.app_state.debounce_timer_active = false;
                 data.app_state.refresh_devices();
+                data.app_state.sync_multi_engine();
                 data.app_state.apply_all_rules(false);
             } else if wparam.0 == TIMER_ID_TRAY_RETRY {
                 if !data.tray_icon.is_added {
@@ -199,11 +191,23 @@ unsafe extern "system" fn dispatcher_wndproc(
     }
 }
 
+fn debug_log(msg: &str) {
+    if let Ok(dir) = std::env::var("APPDATA") {
+        let p = format!("{}\\AudioRouter\\debug.log", dir);
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(p).and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "[{}] {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(), msg)
+        });
+    }
+}
+
 fn main() -> windows::core::Result<()> {
+    debug_log("AudioRouter main() started");
     // 1. Single Instance Guard via Win32 Named Mutex
     let mutex_name = w!("AudioRouterApp_SingleInstance");
     let mutex_handle = unsafe { CreateMutexW(None, true, mutex_name) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        debug_log("Instance already exists, sending IDM_SHOW_UI and exiting");
         // If an instance is already running, ping it to toggle/show the UI!
         unsafe {
             let existing_hwnd = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
@@ -223,6 +227,7 @@ fn main() -> windows::core::Result<()> {
         }
         return Ok(());
     }
+    debug_log("Mutex acquired");
 
     // 2. Set Per-Monitor DPI Awareness V2 for sharp High-DPI UI rendering
     unsafe {
@@ -232,6 +237,37 @@ fn main() -> windows::core::Result<()> {
     // 3. Initialize COM MTA/STA (APARTMENTTHREADED is ideal for Shell_NotifyIcon and message pump)
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+
+    // Attach GUI thread to interactive 'Default' desktop of WinSta0 if started from worker session
+    unsafe {
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        if let Ok(user32) = LoadLibraryW(w!("user32.dll")) {
+            type PfnOpenDesktopW = unsafe extern "system" fn(
+                windows::core::PCWSTR,
+                u32,
+                windows::Win32::Foundation::BOOL,
+                u32,
+            ) -> windows::Win32::Foundation::HANDLE;
+            type PfnSetThreadDesktop =
+                unsafe extern "system" fn(windows::Win32::Foundation::HANDLE) -> windows::Win32::Foundation::BOOL;
+
+            if let Some(p_open) = GetProcAddress(user32, windows::core::s!("OpenDesktopW")) {
+                if let Some(p_set) = GetProcAddress(user32, windows::core::s!("SetThreadDesktop")) {
+                    let open_fn: PfnOpenDesktopW = std::mem::transmute(p_open);
+                    let set_fn: PfnSetThreadDesktop = std::mem::transmute(p_set);
+                    let hdesk = open_fn(
+                        w!("Default"),
+                        0,
+                        windows::Win32::Foundation::BOOL(0),
+                        0x01FF,
+                    );
+                    if !hdesk.is_invalid() {
+                        let _ = set_fn(hdesk);
+                    }
+                }
+            }
+        }
     }
 
     // 4. Register Dispatcher Hidden Window Class
@@ -249,6 +285,7 @@ fn main() -> windows::core::Result<()> {
         let _ = RegisterClassExW(&wc);
     }
 
+    debug_log("RegisterClassExW done, creating hidden dispatcher window");
     // 5. Create Top-Level Hidden Dispatcher Window (0x0, WS_POPUP, NOT HWND_MESSAGE to capture TaskbarCreated)
     let hwnd = unsafe {
         CreateWindowExW(
@@ -264,17 +301,49 @@ fn main() -> windows::core::Result<()> {
             windows::Win32::UI::WindowsAndMessaging::HMENU::default(),
             instance,
             None,
-        )?
+        )
+    };
+
+    let hwnd = match hwnd {
+        Ok(h) => {
+            debug_log(&format!("Dispatcher window created, hwnd={:?}", h.0));
+            h
+        }
+        Err(e) => {
+            debug_log(&format!("CreateWindowExW failed: {:?}", e));
+            return Err(e);
+        }
     };
 
     // 6. Initialize AppState, TrayIcon, and Taskbar message subscription
-    let mut app_state = AppState::new(hwnd)?;
-    let mut tray_icon = TrayIcon::new(hwnd, WM_APP_TRAY, "Audio Router")?;
-    if tray_icon.add().is_err() {
-        // Arm 1-second retry timer in case shell notification tray is initializing
+    debug_log("Initializing AppState");
+    let mut app_state = match AppState::new(hwnd) {
+        Ok(s) => {
+            debug_log("AppState initialized successfully");
+            s
+        }
+        Err(e) => {
+            debug_log(&format!("AppState::new failed: {:?}", e));
+            return Err(e);
+        }
+    };
+
+    debug_log("Initializing TrayIcon");
+    let mut tray_icon = match TrayIcon::new(hwnd, WM_APP_TRAY, "Audio Router") {
+        Ok(t) => t,
+        Err(e) => {
+            debug_log(&format!("TrayIcon::new failed: {:?}", e));
+            return Err(e);
+        }
+    };
+
+    if let Err(e) = tray_icon.add() {
+        debug_log(&format!("tray_icon.add() failed: {:?}, will retry via timer", e));
         unsafe {
             let _ = SetTimer(hwnd, TIMER_ID_TRAY_RETRY, 1000, None);
         }
+    } else {
+        debug_log("tray_icon.add() succeeded!");
     }
 
     let taskbar_created_msg = register_taskbar_created_message();
@@ -290,6 +359,20 @@ fn main() -> windows::core::Result<()> {
     });
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(dispatcher_data) as isize);
+    }
+
+    // If not started with --tray or -m, show the Flyout UI immediately so user sees the interface
+    let args: Vec<String> = std::env::args().collect();
+    let start_in_tray = args.iter().any(|a| a == "--tray" || a == "--minimized" || a == "-m");
+    if !start_in_tray {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::WM_COMMAND,
+                WPARAM(crate::ipc_messages::IDM_SHOW_UI as usize),
+                LPARAM(0),
+            );
+        }
     }
 
     // 7. Message Loop
