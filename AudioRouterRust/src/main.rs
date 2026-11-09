@@ -344,8 +344,13 @@ fn main() -> windows::core::Result<()> {
 
     let taskbar_created_msg = register_taskbar_created_message();
 
-    // Initial pass to enforce active rules on current running audio sessions
+        // Initial pass to enforce active rules on current running audio sessions
     let _ = app_state.apply_all_rules(false);
+
+    // Auto-heal startup registry entry if enabled to ensure --tray flag is present
+    if crate::ui::tray::is_run_at_startup() {
+        let _ = crate::ui::tray::set_run_at_startup(true);
+    }
 
     // Attach state to window user data
     let show_ui_msg = unsafe { windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(w!("AudioRouter_ShowUI")) };
@@ -359,9 +364,22 @@ fn main() -> windows::core::Result<()> {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(dispatcher_data) as isize);
     }
 
-    // If not started with --tray or -m, show the Flyout UI immediately so user sees the interface
+    // If started with --tray, -m, --minimized, --silent, --background, --startup,
+    // OR if Windows system uptime is < 5 minutes (system startup/logon),
+    // stay silently in the system tray without popping up any window.
     let args: Vec<String> = std::env::args().collect();
-    let start_in_tray = args.iter().any(|a| a == "--tray" || a == "--minimized" || a == "-m");
+    let uptime_ms = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+    let is_recent_boot = uptime_ms < 300_000;
+    let explicit_tray = args.iter().any(|a| {
+        a == "--tray"
+            || a == "--minimized"
+            || a == "-m"
+            || a == "--silent"
+            || a == "--background"
+            || a == "--startup"
+    });
+
+    let start_in_tray = explicit_tray || is_recent_boot;
     if !start_in_tray {
         unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(

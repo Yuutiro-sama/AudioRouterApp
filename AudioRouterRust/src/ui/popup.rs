@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Gdi::{
     HBRUSH, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::ProcessStatus::K32EmptyWorkingSet;
-use windows::Win32::System::Threading::GetCurrentProcess;
+use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, SetScrollInfo, DRAWITEMSTRUCT, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES,
     INITCOMMONCONTROLSEX, ODS_SELECTED, TBM_SETPOS, TBM_SETRANGE, TBS_AUTOTICKS, TBS_HORZ,
@@ -28,7 +28,7 @@ use windows::Win32::UI::Shell::{DefSubclassProc, ExtractIconExW, SetWindowSubcla
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CreateWindowExW, DefWindowProcW, DeferWindowPos, DestroyIcon,
     DestroyWindow, EndDeferWindowPos, GetClientRect, GetCursorPos, GetDlgCtrlID, GetParent,
-    GetScrollInfo, GetWindowLongPtrW, PostMessageW, RegisterClassExW,
+    GetScrollInfo, GetWindowLongPtrW, GetWindowThreadProcessId, PostMessageW, RegisterClassExW,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
     ShowWindow, IsWindow, IsWindowVisible, SW_HIDE, WM_CLOSE,
     GetSystemMetrics, LoadImageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED,
@@ -37,11 +37,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CBN_SELCHANGE, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CS_HREDRAW, CS_VREDRAW,
     GWLP_USERDATA, HICON, HMENU, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP,
     SB_THUMBPOSITION, SB_THUMBTRACK, SB_VERT, SCROLLINFO, SIF_ALL, SIF_PAGE, SIF_POS, SIF_RANGE,
-    STM_SETICON, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WINDOW_STYLE, WM_ACTIVATE,
+    STM_SETICON, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE,
     WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM,
     WM_ERASEBKGND, WM_HSCROLL, WM_KEYDOWN, WM_MOUSEWHEEL, WM_PAINT, WM_SETFONT, WM_VSCROLL,
-    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW,
-    WS_CAPTION, WS_SYSMENU, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_VISIBLE, WS_VSCROLL,
+    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::rules::{load_config_v3, save_config_v3};
@@ -169,6 +169,7 @@ struct ChildLayout {
 }
 
 struct FlyoutState {
+    created_at: std::time::Instant,
     owner_hwnd: HWND,
     container_hwnd: HWND,
     scale: f32,
@@ -292,10 +293,10 @@ pub fn calculate_flyout_position(width: i32, height: i32, tray_rect: Option<RECT
                 let cy = tr.top - height - 8;
                 (cx, cy)
             }
-            None => {
-                // Centered nicely on the active monitor screen
-                let cx = work.left + (work.right - work.left - width) / 2;
-                let cy = work.top + (work.bottom - work.top - height) / 2;
+                        None => {
+                // Default to bottom-right corner above taskbar
+                let cx = work.right - width - margin;
+                let cy = work.bottom - height - margin;
                 (cx, cy)
             }
         };
@@ -533,11 +534,11 @@ pub fn toggle_flyout(
         let dummy_height = 360;
         let (pos_x, pos_y) = calculate_flyout_position(dummy_width, dummy_height, tray_rect);
 
-        let hwnd = CreateWindowExW(
-            WS_EX_APPWINDOW,
+                let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             class_name,
-            w!("Audio Router - Quản lý âm thanh"),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            w!("Audio Router Flyout"),
+            WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
             pos_x,
             pos_y,
             dummy_width,
@@ -635,6 +636,7 @@ pub fn toggle_flyout(
         let card_brush = CreateSolidBrush(COLORREF(0x00262626));
 
         // 1. Header Title (fixed on top of flyout window)
+        let close_btn_w = (32.0 * scale) as i32;
         let title_ctrl = CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
             w!("STATIC"),
@@ -642,7 +644,7 @@ pub fn toggle_flyout(
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             pad,
             pad,
-            width - pad * 2,
+            width - pad * 2 - close_btn_w - 4,
             title_h,
             hwnd,
             HMENU(100 as _),
@@ -652,6 +654,24 @@ pub fn toggle_flyout(
         if let Ok(th) = title_ctrl {
             let _ = SendMessageW(th, WM_SETFONT, WPARAM(title_font.0 as usize), LPARAM(1));
         }
+
+        // Close button '✕' on top right
+        let close_btn_h = (26.0 * scale) as i32;
+        let close_btn_x = width - pad - close_btn_w;
+        let _close_ctrl = CreateWindowExW(
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+            w!("BUTTON"),
+            w!("✕"),
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
+            close_btn_x,
+            pad,
+            close_btn_w,
+            close_btn_h,
+            hwnd,
+            HMENU(101 as _),
+            instance,
+            None,
+        );
 
         // 2. Child container window holding the scrollable content
         let container_style = if max_scroll_y > 0 {
@@ -1125,6 +1145,7 @@ pub fn toggle_flyout(
         }
 
         let state = Box::new(FlyoutState {
+            created_at: std::time::Instant::now(),
             owner_hwnd,
             container_hwnd,
             scale,
@@ -1166,7 +1187,38 @@ unsafe extern "system" fn flyout_wndproc(
     let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut FlyoutState;
 
     match msg {
-                WM_ACTIVATE => {
+                        WM_ACTIVATE => {
+            let active_state = (wparam.0 as u32) & 0xFFFF;
+            if active_state == WA_INACTIVE as u32 {
+                if !state_ptr.is_null() {
+                    let state = &*state_ptr;
+                    // Do not close within 600ms of creation to avoid startup activation race
+                    if state.created_at.elapsed().as_millis() < 600 {
+                        return LRESULT(0);
+                    }
+                }
+                let other_hwnd = HWND(lparam.0 as _);
+                if !other_hwnd.is_invalid() && !other_hwnd.0.is_null() {
+                    let mut target_pid = 0u32;
+                    unsafe {
+                        GetWindowThreadProcessId(other_hwnd, Some(&mut target_pid));
+                    }
+                    let current_pid = unsafe { GetCurrentProcessId() };
+                    if target_pid == current_pid {
+                        return LRESULT(0);
+                    }
+                }
+
+                if !state_ptr.is_null() {
+                    let state = &*state_ptr;
+                    if state.is_dropdown_open {
+                        return LRESULT(0);
+                    }
+                }
+
+                close_flyout();
+                return LRESULT(0);
+            }
             return LRESULT(0);
         }
 
@@ -1242,6 +1294,24 @@ unsafe extern "system" fn flyout_wndproc(
             if !state_ptr.is_null() {
                 let state = &*state_ptr;
                 let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
+
+                // Handle Close button (ID 101)
+                if dis.CtlID == 101 {
+                    let hdc = dis.hDC;
+                    let mut rc = dis.rcItem;
+                    let is_selected = (dis.itemState.0 & ODS_SELECTED.0) != 0;
+                    let bg_col = if is_selected { COLORREF(0x004A4A4A) } else { COLORREF(0x002A2A2A) };
+                    let brush = CreateSolidBrush(bg_col);
+                    FillRect(hdc, &rc, brush);
+                    let _ = DeleteObject(brush);
+                    SetBkMode(hdc, TRANSPARENT);
+                    SetTextColor(hdc, COLORREF(0x00CCCCCC));
+                    
+                    let mut x_wide: [u16; 2] = [0x2715, 0];
+                    let _ = DrawTextW(hdc, &mut x_wide[..1], &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                    return LRESULT(1);
+                }
+
                 let btn_hwnd = dis.hwndItem;
                 let is_selected = (dis.itemState.0 & ODS_SELECTED.0) != 0;
 
@@ -1470,6 +1540,11 @@ unsafe extern "system" fn flyout_wndproc(
                         }
                     }
                 } else if notify_code == BN_CLICKED as u32 {
+                    let ctrl_id = (wparam.0 as usize) & 0xFFFF;
+                    if ctrl_id == 101 {
+                        close_flyout();
+                        return LRESULT(0);
+                    }
                     // Check Secondary Output Toggle Button
                     for b in &mut state.app_bindings {
                         if b.toggle2_hwnd.0 as isize == lparam.0 {
