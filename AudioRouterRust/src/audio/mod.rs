@@ -50,7 +50,7 @@ pub struct MultiOutputEngine {
     pub(crate) targets: Arc<RwLock<Vec<Arc<RenderTargetState>>>>,
     capture_handle: Option<std::thread::JoinHandle<()>>,
     render_workers: HashMap<String, std::thread::JoinHandle<()>>,
-    bridges: HashMap<(String, String), DualOutputBridge>,
+    bridges: HashMap<(u32, String), DualOutputBridge>,
     stop_signal: Arc<AtomicBool>,
     capture_sample_rate: Arc<AtomicU32>,
     is_running: bool,
@@ -194,26 +194,36 @@ impl MultiOutputEngine {
     }
 
     /// Synchronizes active per-app dual-output bridges.
-    /// `active_routes`: list of (source_device_id, target_device_id) pairs
-    pub fn sync_bridges(&mut self, active_routes: Vec<(String, String)>) {
-        let mut needed_set: std::collections::HashSet<(String, String)> =
-            active_routes.into_iter().collect();
+    /// `active_routes`: list of (pid, source_device_id, target_device_id) tuples.
+    pub fn sync_bridges(&mut self, active_routes: Vec<(u32, String, String)>) {
+        let mut needed: HashMap<(u32, String), String> = HashMap::new();
+        for (pid, source_id, target_id) in active_routes {
+            needed.insert((pid, target_id), source_id);
+        }
 
-        // 1. Remove bridges that are no longer needed
+        // 1. Remove bridges that are no longer needed or whose source device changed
         self.bridges.retain(|k, bridge| {
-            if needed_set.contains(k) {
-                needed_set.remove(k);
-                true
-            } else {
-                bridge.stop();
-                false
+            if let Some(src_id) = needed.get(k) {
+                if &bridge.source_device_id == src_id {
+                    return true;
+                }
             }
+            bridge.stop();
+            false
         });
 
-        // 2. Start newly requested bridges
-        for (source_id, target_id) in needed_set {
-            if let Ok(bridge) = DualOutputBridge::start(source_id.clone(), target_id.clone()) {
-                self.bridges.insert((source_id, target_id), bridge);
+        // 2. Remove already running bridges from needed so we don't start them again
+        for k in self.bridges.keys() {
+            needed.remove(k);
+        }
+
+        // 3. Start newly requested bridges
+        for ((pid, target_id), source_id) in needed {
+            if source_id == target_id || target_id.is_empty() {
+                continue;
+            }
+            if let Ok(bridge) = DualOutputBridge::start(pid, source_id, target_id.clone()) {
+                self.bridges.insert((pid, target_id), bridge);
             }
         }
     }
@@ -234,6 +244,34 @@ impl MultiOutputEngine {
                 b.set_muted(muted);
             }
         }
+    }
+
+    /// Sets volume on bridges targeting `target_device_id` for a specific PID.
+    pub fn set_bridge_volume_for_pid(&self, pid: u32, target_device_id: &str, volume: f32) {
+        for ((p, tgt), b) in &self.bridges {
+            if *p == pid && tgt == target_device_id {
+                b.set_volume(volume);
+            }
+        }
+    }
+
+    /// Sets mute on bridges targeting `target_device_id` for a specific PID.
+    pub fn set_bridge_muted_for_pid(&self, pid: u32, target_device_id: &str, muted: bool) {
+        for ((p, tgt), b) in &self.bridges {
+            if *p == pid && tgt == target_device_id {
+                b.set_muted(muted);
+            }
+        }
+    }
+
+    /// Returns the number of currently active dual-output bridges.
+    pub fn active_bridge_count(&self) -> usize {
+        self.bridges.len()
+    }
+
+    /// Returns list of active bridge keys: (pid, target_device_id).
+    pub fn get_active_bridge_keys(&self) -> Vec<(u32, String)> {
+        self.bridges.keys().cloned().collect()
     }
 
     /// Enables or disables output to a specific audio endpoint.
@@ -385,5 +423,14 @@ mod tests {
         engine.set_device_enabled("dev_secondary", false);
         assert!(!engine.get_target_by_id("dev_secondary").unwrap().is_enabled());
         assert!(!engine.has_active_secondary());
+    }
+
+    #[test]
+    fn test_multi_output_engine_sync_bridges_empty() {
+        let mut engine = MultiOutputEngine::new();
+        assert_eq!(engine.active_bridge_count(), 0);
+        engine.sync_bridges(Vec::new());
+        assert_eq!(engine.active_bridge_count(), 0);
+        assert!(engine.get_active_bridge_keys().is_empty());
     }
 }

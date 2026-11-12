@@ -65,45 +65,12 @@ impl AppState {
         // 5. Query active render devices
         let devices = enumerate_render_devices().unwrap_or_default();
 
-        // 6. Initialize Multi-Output Engine with saved ConfigV3
+        // 6. Initialize Multi-Output Engine
         let mut multi_engine = MultiOutputEngine::new();
         let _ = multi_engine.refresh_targets();
-
-        let config_v3 = load_config_v3();
-        let default_dev = get_default_render_device().ok().flatten();
-        let default_id = default_dev.as_ref().map(|d| d.id.as_str()).unwrap_or_default();
-
-        let mut active_pairs: Vec<(String, String)> = Vec::new();
-
-        for (_app_key, rule) in &config_v3.apps {
-            if rule.secondary_enabled && !rule.secondary_device.is_empty() {
-                let source = if !rule.primary_device.is_empty() && rule.primary_device != "multi" {
-                    rule.primary_device.clone()
-                } else {
-                    default_id.to_string()
-                };
-                let target = rule.secondary_device.clone();
-                if source != target && !target.is_empty() {
-                    active_pairs.push((source, target));
-                }
-            }
-        }
-        for (app_key, sec_id) in &config_v3.app_secondary_rules {
-            if config_v3.is_app_secondary_enabled(app_key) && !sec_id.is_empty() {
-                let prim = config_v3.get_legacy_app_rule(app_key).cloned().unwrap_or_else(|| default_id.to_string());
-                let source = if !prim.is_empty() && prim != "multi" { prim } else { default_id.to_string() };
-                let target = sec_id.clone();
-                if source != target && !target.is_empty() && !active_pairs.contains(&(source.clone(), target.clone())) {
-                    active_pairs.push((source, target));
-                }
-            }
-        }
-
-        multi_engine.sync_bridges(active_pairs);
-
         let multi_engine = Arc::new(RwLock::new(multi_engine));
 
-        Ok(Self {
+        let state = Self {
             factory,
             enumerator,
             hotplug_client,
@@ -112,7 +79,12 @@ impl AppState {
             debounce_timer_active: false,
             notify_hwnd,
             multi_engine,
-        })
+        };
+
+        // Synchronize active app sessions and dual routing bridges immediately
+        state.sync_multi_engine();
+
+        Ok(state)
     }
 
     /// Refreshes the cached list of audio output devices and multi_engine targets.
@@ -126,42 +98,57 @@ impl AppState {
     }
 
     /// Synchronizes MultiOutputEngine targets and volume/mute settings with ConfigV3.
-    /// In the Per-App Dual Output architecture, secondary endpoints are enabled
-    /// when at least one application has `secondary_enabled == true` targeting that endpoint.
+    /// In the Process-Specific Dual Routing architecture, secondary routes are only active
+    /// for specific running application sessions (PIDs) that have `secondary_enabled == true`.
     pub fn sync_multi_engine(&self) {
         let config = load_config_v3();
         let default_dev = get_default_render_device().ok().flatten();
         let default_id = default_dev.as_ref().map(|d| d.id.as_str()).unwrap_or_default();
 
-        let mut active_pairs: Vec<(String, String)> = Vec::new();
+        let sessions = get_active_app_sessions(&self.devices);
+        let mut active_routes: Vec<(u32, String, String)> = Vec::new();
+        let mut seen_routes: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
 
-        for (_app_key, rule) in &config.apps {
+        for session in &sessions {
+            let rule = config.get_app_rule(&session.name);
             if rule.secondary_enabled && !rule.secondary_device.is_empty() {
-                let source = if !rule.primary_device.is_empty() && rule.primary_device != "multi" {
+                let primary = if !rule.primary_device.is_empty() && rule.primary_device != "multi" {
                     rule.primary_device.clone()
+                } else if let Some(legacy_prim) = self.get_rule(&session.name) {
+                    if !legacy_prim.is_empty() && legacy_prim != "multi" {
+                        legacy_prim.clone()
+                    } else if !session.current_device_id.is_empty() {
+                        session.current_device_id.clone()
+                    } else {
+                        default_id.to_string()
+                    }
+                } else if !session.current_device_id.is_empty() {
+                    session.current_device_id.clone()
                 } else {
                     default_id.to_string()
                 };
-                let target = rule.secondary_device.clone();
-                if source != target && !target.is_empty() {
-                    active_pairs.push((source, target));
-                }
-            }
-        }
-        for (app_key, sec_id) in &config.app_secondary_rules {
-            if config.is_app_secondary_enabled(app_key) && !sec_id.is_empty() {
-                let prim = config.get_legacy_app_rule(app_key).cloned().unwrap_or_else(|| default_id.to_string());
-                let source = if !prim.is_empty() && prim != "multi" { prim } else { default_id.to_string() };
-                let target = sec_id.clone();
-                if source != target && !target.is_empty() && !active_pairs.contains(&(source.clone(), target.clone())) {
-                    active_pairs.push((source, target));
+                let secondary = rule.secondary_device.trim().to_string();
+
+                if !secondary.is_empty() && secondary != primary && secondary != "multi" {
+                    let mut target_pids = vec![session.pid];
+                    for sibling_pid in get_pids_by_process_name(&session.name) {
+                        if !target_pids.contains(&sibling_pid) {
+                            target_pids.push(sibling_pid);
+                        }
+                    }
+
+                    for pid in target_pids {
+                        if seen_routes.insert((pid, secondary.clone())) {
+                            active_routes.push((pid, primary.clone(), secondary.clone()));
+                        }
+                    }
                 }
             }
         }
 
         if let Ok(mut engine) = self.multi_engine.write() {
             let _ = engine.refresh_targets();
-            engine.sync_bridges(active_pairs);
+            engine.sync_bridges(active_routes);
 
             for (dev_id, &vol) in &config.device_volumes {
                 engine.set_bridge_volume(dev_id, vol);

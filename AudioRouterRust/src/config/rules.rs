@@ -341,6 +341,13 @@ impl ConfigV3 {
         let key = normalize_app_key(&app_name);
         let entry = self.apps.entry(key.clone()).or_insert_with(AppRuleV3::default);
         entry.primary_device = dev_id.clone();
+        // Nếu thiết bị phụ trùng thiết bị chính vừa chọn, tự động xóa thiết bị phụ để tránh vòng lặp
+        if !dev_id.is_empty() && entry.secondary_device == dev_id {
+            entry.secondary_device.clear();
+            entry.secondary_enabled = false;
+            self.app_secondary_rules.remove(&key);
+            self.app_secondary_enabled.insert(key.clone(), false);
+        }
         // Đồng bộ trường legacy
         self.app_rules.insert(key, dev_id);
     }
@@ -359,7 +366,19 @@ impl ConfigV3 {
     pub fn set_app_secondary_device(&mut self, app_name: String, dev_id: String) {
         let key = normalize_app_key(&app_name);
         let entry = self.apps.entry(key.clone()).or_insert_with(AppRuleV3::default);
+        // Không cho phép thiết bị phụ trùng với thiết bị chính
+        if !entry.primary_device.is_empty() && entry.primary_device == dev_id {
+            entry.secondary_device.clear();
+            entry.secondary_enabled = false;
+            self.app_secondary_rules.remove(&key);
+            self.app_secondary_enabled.insert(key, false);
+            return;
+        }
         entry.secondary_device = dev_id.clone();
+        if dev_id.is_empty() {
+            entry.secondary_enabled = false;
+            self.app_secondary_enabled.insert(key.clone(), false);
+        }
         // Đồng bộ trường legacy
         self.app_secondary_rules.insert(key, dev_id);
     }
@@ -373,6 +392,11 @@ impl ConfigV3 {
     pub fn set_app_secondary_enabled(&mut self, app_name: String, enabled: bool) {
         let key = normalize_app_key(&app_name);
         let entry = self.apps.entry(key.clone()).or_insert_with(AppRuleV3::default);
+        if enabled && (entry.secondary_device.is_empty() || (!entry.primary_device.is_empty() && entry.secondary_device == entry.primary_device)) {
+            entry.secondary_enabled = false;
+            self.app_secondary_enabled.insert(key, false);
+            return;
+        }
         entry.secondary_enabled = enabled;
         // Đồng bộ trường legacy
         self.app_secondary_enabled.insert(key, enabled);
@@ -484,6 +508,29 @@ impl ConfigV3 {
         // Đồng bộ trường legacy app_mutes
         self.app_mutes.insert(key, muted);
     }
+
+    /// Chuẩn hóa dữ liệu cấu hình, loại bỏ trường hợp secondary trùng primary hoặc secondary_enabled bật khi chưa chọn thiết bị phụ.
+    pub fn sanitize(&mut self) {
+        for (k, rule) in &mut self.apps {
+            if !rule.primary_device.is_empty() && rule.primary_device == rule.secondary_device {
+                rule.secondary_device.clear();
+                rule.secondary_enabled = false;
+                self.app_secondary_rules.remove(k);
+                self.app_secondary_enabled.insert(k.clone(), false);
+            } else if rule.secondary_device.is_empty() {
+                rule.secondary_enabled = false;
+                self.app_secondary_enabled.insert(k.clone(), false);
+            }
+        }
+        for (k, sec_id) in &mut self.app_secondary_rules {
+            if let Some(prim_id) = self.app_rules.get(k) {
+                if !prim_id.is_empty() && prim_id == sec_id {
+                    sec_id.clear();
+                    self.app_secondary_enabled.insert(k.clone(), false);
+                }
+            }
+        }
+    }
 }
 
 /// Thư mục cơ sở `%APPDATA%\AudioRouter`
@@ -549,6 +596,7 @@ pub fn load_config_v3() -> ConfigV3 {
                         });
                     }
                 }
+                cfg.sanitize();
                 return cfg;
             }
         }
@@ -569,6 +617,7 @@ pub fn load_config_v3() -> ConfigV3 {
             });
             cfg.app_rules.insert(norm, v.clone());
         }
+        cfg.sanitize();
         let _ = save_config_v3(&cfg);
         return cfg;
     }
@@ -861,5 +910,43 @@ mod tests {
         cleanup.set_device_enabled(test_dev.into(), false);
         cleanup.device_volumes.remove(test_dev);
         let _ = save_config_v3(&cleanup);
+    }
+
+    #[test]
+    fn test_config_v3_sanitize_and_duplicate_prevention() {
+        let mut cfg = ConfigV3::new();
+        // 1. Cannot enable secondary if secondary device is empty
+        cfg.set_app_primary_device("test.exe".into(), "dev_1".into());
+        cfg.set_app_secondary_enabled("test.exe".into(), true);
+        assert!(!cfg.get_app_rule("test.exe").secondary_enabled);
+
+        // 2. Cannot set secondary device to same as primary
+        cfg.set_app_secondary_device("test.exe".into(), "dev_1".into());
+        assert_eq!(cfg.get_app_rule("test.exe").secondary_device, "");
+        assert!(!cfg.get_app_rule("test.exe").secondary_enabled);
+
+        // 3. Setting valid secondary device and enabling
+        cfg.set_app_secondary_device("test.exe".into(), "dev_2".into());
+        cfg.set_app_secondary_enabled("test.exe".into(), true);
+        assert_eq!(cfg.get_app_rule("test.exe").secondary_device, "dev_2");
+        assert!(cfg.get_app_rule("test.exe").secondary_enabled);
+
+        // 4. Changing primary to match secondary automatically cleans secondary
+        cfg.set_app_primary_device("test.exe".into(), "dev_2".into());
+        assert_eq!(cfg.get_app_rule("test.exe").primary_device, "dev_2");
+        assert_eq!(cfg.get_app_rule("test.exe").secondary_device, "");
+        assert!(!cfg.get_app_rule("test.exe").secondary_enabled);
+
+        // 5. sanitize() cleans raw corrupted entries (e.g. from disk or bad external JSON)
+        cfg.apps.insert("bad.exe".into(), AppRuleV3 {
+            primary_device: "dev_dup".into(),
+            secondary_device: "dev_dup".into(),
+            secondary_enabled: true,
+            volume: 1.0,
+            muted: false,
+        });
+        cfg.sanitize();
+        assert_eq!(cfg.get_app_rule("bad.exe").secondary_device, "");
+        assert!(!cfg.get_app_rule("bad.exe").secondary_enabled);
     }
 }

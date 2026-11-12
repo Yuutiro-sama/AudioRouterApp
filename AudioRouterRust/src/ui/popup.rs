@@ -487,6 +487,18 @@ pub fn toggle_flyout(
             app.secondary_device_id = rule.secondary_device.clone();
         }
         app.secondary_enabled = rule.secondary_enabled;
+
+        // Chuẩn hóa: thiết bị phụ không được trùng thiết bị chính
+        let effective_primary = if !app.primary_device_id.is_empty() {
+            &app.primary_device_id
+        } else {
+            &app.current_device_id
+        };
+        if !app.secondary_device_id.is_empty() && app.secondary_device_id == *effective_primary {
+            app.secondary_device_id.clear();
+            app.secondary_enabled = false;
+        }
+
         if rule.muted || config.is_app_muted(&app.name) {
             app.is_muted = true;
         }
@@ -1330,7 +1342,7 @@ unsafe extern "system" fn flyout_wndproc(
                             let bg = if is_selected { COLORREF(0x00484848) } else { COLORREF(0x00383838) };
                             let border = COLORREF(0x004E4E4E);
                             let text = COLORREF(0x00CCCCCC);
-                            (bg, border, text, "Tắt")
+                            (bg, border, text, "Đã tắt")
                         };
 
                         let pen = CreatePen(PS_SOLID, 1, border_col);
@@ -1502,6 +1514,29 @@ unsafe extern "system" fn flyout_wndproc(
                                 }
                             }
 
+                            // Nếu thiết bị chính vừa chọn trùng với thiết bị phụ đang có, an toàn reset thiết bị phụ
+                            let effective_primary = if !app.primary_device_id.is_empty() {
+                                app.primary_device_id.clone()
+                            } else if !app.current_device_id.is_empty() {
+                                app.current_device_id.clone()
+                            } else {
+                                crate::audio::enumerator::get_default_render_device()
+                                    .ok()
+                                    .flatten()
+                                    .map(|d| d.id)
+                                    .unwrap_or_default()
+                            };
+
+                            if !app.secondary_device_id.is_empty() && app.secondary_device_id == effective_primary {
+                                let _ = SendMessageW(b.combo2_hwnd, CB_SETCURSEL, WPARAM(0), LPARAM(0));
+                                app.secondary_device_id.clear();
+                                app.secondary_enabled = false;
+                                let _ = InvalidateRect(b.toggle2_hwnd, None, BOOL(1));
+                                config.set_app_secondary_device(app.name.clone(), String::new());
+                                config.set_app_secondary_enabled(app.name.clone(), false);
+                                let _ = save_config_v3(&config);
+                            }
+
                             let _ = PostMessageW(
                                 state.owner_hwnd,
                                 WM_APP_APPLY_RULES,
@@ -1517,25 +1552,49 @@ unsafe extern "system" fn flyout_wndproc(
                             let app = &mut state.apps[b.app_index];
                             let mut config = load_config_v3();
 
+                            let effective_primary = if !app.primary_device_id.is_empty() {
+                                app.primary_device_id.clone()
+                            } else if !app.current_device_id.is_empty() {
+                                app.current_device_id.clone()
+                            } else {
+                                crate::audio::enumerator::get_default_render_device()
+                                    .ok()
+                                    .flatten()
+                                    .map(|d| d.id)
+                                    .unwrap_or_default()
+                            };
+
                             if sel == 0 {
                                 app.secondary_device_id.clear();
+                                app.secondary_enabled = false;
+                                let _ = InvalidateRect(b.toggle2_hwnd, None, BOOL(1));
                                 config.set_app_secondary_device(app.name.clone(), String::new());
+                                config.set_app_secondary_enabled(app.name.clone(), false);
                                 let _ = save_config_v3(&config);
                             } else if sel - 1 < state.devices.len() {
                                 let dev = &state.devices[sel - 1];
-                                app.secondary_device_id = dev.id.clone();
-                                config.set_app_secondary_device(app.name.clone(), dev.id.clone());
-                                let _ = save_config_v3(&config);
+                                if !effective_primary.is_empty() && dev.id == effective_primary {
+                                    // Người dùng chọn trùng thiết bị chính: Xử lý an toàn, không tạo vòng lặp bridge vô nghĩa
+                                    let _ = SendMessageW(b.combo2_hwnd, CB_SETCURSEL, WPARAM(0), LPARAM(0));
+                                    app.secondary_device_id.clear();
+                                    app.secondary_enabled = false;
+                                    let _ = InvalidateRect(b.toggle2_hwnd, None, BOOL(1));
+                                    config.set_app_secondary_device(app.name.clone(), String::new());
+                                    config.set_app_secondary_enabled(app.name.clone(), false);
+                                    let _ = save_config_v3(&config);
+                                } else {
+                                    app.secondary_device_id = dev.id.clone();
+                                    config.set_app_secondary_device(app.name.clone(), dev.id.clone());
+                                    let _ = save_config_v3(&config);
+                                }
                             }
 
-                            if app.secondary_enabled {
-                                let _ = PostMessageW(
-                                    state.owner_hwnd,
-                                    WM_APP_APPLY_RULES,
-                                    WPARAM(app.pid as usize),
-                                    LPARAM(2),
-                                );
-                            }
+                            let _ = PostMessageW(
+                                state.owner_hwnd,
+                                WM_APP_APPLY_RULES,
+                                WPARAM(app.pid as usize),
+                                LPARAM(if app.secondary_enabled { 2 } else { 0 }),
+                            );
                             break;
                         }
                     }
@@ -1551,19 +1610,33 @@ unsafe extern "system" fn flyout_wndproc(
                             let app = &mut state.apps[b.app_index];
                             app.secondary_enabled = !app.secondary_enabled;
 
-                            // If enabling secondary output but none was selected, auto-select first available other device
-                            if app.secondary_enabled && app.secondary_device_id.is_empty() {
-                                let prim_id = if !app.primary_device_id.is_empty() {
-                                    &app.primary_device_id
-                                } else {
-                                    &app.current_device_id
-                                };
-                                if let Some((idx, dev)) = state.devices.iter().enumerate().find(|(_, d)| &d.id != prim_id) {
-                                    app.secondary_device_id = dev.id.clone();
-                                    let _ = SendMessageW(b.combo2_hwnd, CB_SETCURSEL, WPARAM(idx + 1), LPARAM(0));
-                                    let mut config = load_config_v3();
-                                    config.set_app_secondary_device(app.name.clone(), dev.id.clone());
-                                    let _ = save_config_v3(&config);
+                            let effective_primary = if !app.primary_device_id.is_empty() {
+                                app.primary_device_id.clone()
+                            } else if !app.current_device_id.is_empty() {
+                                app.current_device_id.clone()
+                            } else {
+                                crate::audio::enumerator::get_default_render_device()
+                                    .ok()
+                                    .flatten()
+                                    .map(|d| d.id)
+                                    .unwrap_or_default()
+                            };
+
+                            // Nếu bật thiết bị phụ nhưng chưa chọn hoặc chọn trùng thiết bị chính, tự động tìm thiết bị khác
+                            if app.secondary_enabled {
+                                if app.secondary_device_id.is_empty() || app.secondary_device_id == effective_primary {
+                                    if let Some((idx, dev)) = state.devices.iter().enumerate().find(|(_, d)| d.id != effective_primary) {
+                                        app.secondary_device_id = dev.id.clone();
+                                        let _ = SendMessageW(b.combo2_hwnd, CB_SETCURSEL, WPARAM(idx + 1), LPARAM(0));
+                                        let mut config = load_config_v3();
+                                        config.set_app_secondary_device(app.name.clone(), dev.id.clone());
+                                        let _ = save_config_v3(&config);
+                                    } else {
+                                        // Không có thiết bị phát thứ 2 hợp lệ
+                                        app.secondary_enabled = false;
+                                        app.secondary_device_id.clear();
+                                        let _ = SendMessageW(b.combo2_hwnd, CB_SETCURSEL, WPARAM(0), LPARAM(0));
+                                    }
                                 }
                             }
 
@@ -1739,6 +1812,28 @@ mod tests {
         assert!(!app.secondary_enabled);
         assert_eq!(app.volume, 1.0);
         assert!(!app.is_muted);
+    }
+
+    #[test]
+    fn test_app_audio_item_secondary_toggle_sanitization() {
+        let mut app = AppAudioItem::new(1234, "brave.exe".into());
+        app.primary_device_id = "dev_speaker".into();
+        app.secondary_device_id = "dev_speaker".into();
+        app.secondary_enabled = true;
+
+        // Effective primary device match should sanitize secondary
+        let effective_primary = if !app.primary_device_id.is_empty() {
+            &app.primary_device_id
+        } else {
+            &app.current_device_id
+        };
+        if !app.secondary_device_id.is_empty() && app.secondary_device_id == *effective_primary {
+            app.secondary_device_id.clear();
+            app.secondary_enabled = false;
+        }
+
+        assert_eq!(app.secondary_device_id, "");
+        assert!(!app.secondary_enabled);
     }
 
     #[test]

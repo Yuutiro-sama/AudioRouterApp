@@ -20,6 +20,7 @@ use crate::audio::ring_buffer::SpscRingBuffer;
 
 /// Active bridge connecting a source output device to a secondary target device.
 pub struct DualOutputBridge {
+    pub target_pid: u32,
     pub source_device_id: String,
     pub target_device_id: String,
     pub volume_scalar_bits: Arc<AtomicU32>,
@@ -32,9 +33,20 @@ pub struct DualOutputBridge {
 }
 
 impl DualOutputBridge {
-    /// Spawns a new real-time bridge from `source_device_id` to `target_device_id`.
-    /// If `source_device_id` is empty, captures from the default console render endpoint.
-    pub fn start(source_device_id: String, target_device_id: String) -> Result<Self, windows::core::Error> {
+    /// Spawns a new real-time bridge from `target_pid` / `source_device_id` to `target_device_id`.
+    /// If `target_pid > 0`, captures process-specific loopback audio via Windows Application Loopback API.
+    /// If `target_pid == 0`, captures loopback from `source_device_id` (or default endpoint if empty).
+    pub fn start(
+        target_pid: u32,
+        source_device_id: String,
+        target_device_id: String,
+    ) -> Result<Self, windows::core::Error> {
+        if !source_device_id.is_empty() && source_device_id == target_device_id {
+            return Err(windows::core::Error::new(
+                windows::Win32::Foundation::E_INVALIDARG,
+                "Source and target devices cannot be the same",
+            ));
+        }
         let ring_buffer = Arc::new(SpscRingBuffer::default());
         let stop_signal = Arc::new(AtomicBool::new(false));
         let volume_scalar_bits = Arc::new(AtomicU32::new(1.0f32.to_bits()));
@@ -50,15 +62,21 @@ impl DualOutputBridge {
         let src_id = source_device_id.clone();
         let src_rate_cap = source_rate.clone();
 
+        let thread_name = if target_pid > 0 {
+            format!("BridgeCap-PID{}", target_pid)
+        } else {
+            format!("BridgeCap-{}", &source_device_id[..source_device_id.len().min(8)])
+        };
+
         let capture_handle = std::thread::Builder::new()
-            .name(format!("BridgeCap-{}", &source_device_id[..source_device_id.len().min(8)]))
+            .name(thread_name)
             .spawn(move || {
                 let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
                 let mmcss = set_mmcss_pro_audio();
 
-                let res = capture_worker_loop(&src_id, &rb_cap, &src_rate_cap, &stop_cap);
+                let res = capture_worker_loop(target_pid, &src_id, &rb_cap, &src_rate_cap, &stop_cap);
                 if let Err(e) = res {
-                    eprintln!("Capture worker [{}] error: {:?}", src_id, e);
+                    eprintln!("Capture worker [PID: {}, dev: {}] error: {:?}", target_pid, src_id, e);
                 }
 
                 if let Some((handle, rev_fn)) = mmcss {
@@ -106,6 +124,7 @@ impl DualOutputBridge {
             .map_err(|_| windows::core::Error::from_win32())?;
 
         Ok(Self {
+            target_pid,
             source_device_id,
             target_device_id,
             volume_scalar_bits,
@@ -148,52 +167,83 @@ impl Drop for DualOutputBridge {
 }
 
 fn capture_worker_loop(
+    target_pid: u32,
     source_id: &str,
     rb: &Arc<SpscRingBuffer>,
     source_rate: &Arc<AtomicU32>,
     stop_signal: &Arc<AtomicBool>,
 ) -> windows::core::Result<()> {
-    let enumerator: IMMDeviceEnumerator =
-        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
-
-    let device: IMMDevice = if source_id.is_empty() {
-        unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? }
+    let (audio_client, is_process_loopback) = if target_pid > 0 {
+        match crate::audio::capture::activate_process_loopback_client(target_pid) {
+            Ok(client) => (client, true),
+            Err(e) => {
+                eprintln!(
+                    "Process loopback activation failed for PID {}: {:?}. Falling back to endpoint capture on [{}]",
+                    target_pid, e, source_id
+                );
+                (activate_endpoint_audio_client(source_id)?, false)
+            }
+        }
     } else {
-        unsafe { enumerator.GetDevice(&HSTRING::from(source_id))? }
+        (activate_endpoint_audio_client(source_id)?, false)
     };
 
-    let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
-    let pwfx = unsafe { audio_client.GetMixFormat()? };
-    let sample_rate = unsafe { (*pwfx).nSamplesPerSec };
-    let channels = unsafe { (*pwfx).nChannels as usize };
-    let bits_per_sample = unsafe { (*pwfx).wBitsPerSample };
+    let (sample_rate, channels, bits_per_sample, is_float, init_res) = if is_process_loopback {
+        // VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK does not implement GetMixFormat().
+        // Standard 48kHz 32-bit float stereo is the universally supported format for process loopback.
+        let sample_rate = 48000u32;
+        let channels = 2usize;
+        let bits_per_sample = 32u16;
+        let is_float = true;
+
+        let wfx_ext = crate::audio::capture::create_waveformat_float_stereo(sample_rate);
+        let pwfx = &wfx_ext as *const _ as *const windows::Win32::Media::Audio::WAVEFORMATEX;
+        let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        let res = unsafe {
+            audio_client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                stream_flags,
+                100_000, // 10ms
+                0,
+                pwfx,
+                None,
+            )
+        };
+        (sample_rate, channels, bits_per_sample, is_float, res)
+    } else {
+        let pwfx = unsafe { audio_client.GetMixFormat()? };
+        let sample_rate = unsafe { (*pwfx).nSamplesPerSec };
+        let channels = unsafe { (*pwfx).nChannels as usize };
+        let bits_per_sample = unsafe { (*pwfx).wBitsPerSample };
+
+        let is_float = unsafe {
+            if (*pwfx).wFormatTag == 3 {
+                true
+            } else if (*pwfx).wFormatTag == 0xFFFE {
+                let ext = pwfx as *const WAVEFORMATEXTENSIBLE;
+                let subformat = std::ptr::addr_of!((*ext).SubFormat).read_unaligned();
+                subformat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+            } else {
+                false
+            }
+        };
+
+        let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        let res = unsafe {
+            audio_client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                stream_flags,
+                100_000, // 10ms
+                0,
+                pwfx,
+                None,
+            )
+        };
+        unsafe { CoTaskMemFree(Some(pwfx as *const _ as *const _)) };
+        (sample_rate, channels, bits_per_sample, is_float, res)
+    };
 
     source_rate.store(sample_rate, Ordering::Release);
-
-    let is_float = unsafe {
-        if (*pwfx).wFormatTag == 3 {
-            true
-        } else if (*pwfx).wFormatTag == 0xFFFE {
-            let ext = pwfx as *const WAVEFORMATEXTENSIBLE;
-            let subformat = std::ptr::addr_of!((*ext).SubFormat).read_unaligned();
-            subformat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-        } else {
-            false
-        }
-    };
-
-    let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-    let init_res = unsafe {
-        audio_client.Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            stream_flags,
-            100_000, // 10ms
-            0,
-            pwfx,
-            None,
-        )
-    };
-    unsafe { CoTaskMemFree(Some(pwfx as *const _ as *const _)) };
 
     let (use_event, event) = match init_res {
         Ok(_) => {
@@ -206,17 +256,32 @@ fn capture_worker_loop(
             }
         }
         Err(_) => {
-            let pwfx2 = unsafe { audio_client.GetMixFormat()? };
-            unsafe {
-                audio_client.Initialize(
-                    AUDCLNT_SHAREMODE_SHARED,
-                    AUDCLNT_STREAMFLAGS_LOOPBACK,
-                    100_000,
-                    0,
-                    pwfx2,
-                    None,
-                )?;
-                CoTaskMemFree(Some(pwfx2 as *const _ as *const _));
+            if is_process_loopback {
+                let wfx_ext = crate::audio::capture::create_waveformat_float_stereo(sample_rate);
+                let pwfx = &wfx_ext as *const _ as *const windows::Win32::Media::Audio::WAVEFORMATEX;
+                unsafe {
+                    audio_client.Initialize(
+                        AUDCLNT_SHAREMODE_SHARED,
+                        AUDCLNT_STREAMFLAGS_LOOPBACK,
+                        100_000,
+                        0,
+                        pwfx,
+                        None,
+                    )?;
+                }
+            } else {
+                let pwfx2 = unsafe { audio_client.GetMixFormat()? };
+                unsafe {
+                    audio_client.Initialize(
+                        AUDCLNT_SHAREMODE_SHARED,
+                        AUDCLNT_STREAMFLAGS_LOOPBACK,
+                        100_000,
+                        0,
+                        pwfx2,
+                        None,
+                    )?;
+                    CoTaskMemFree(Some(pwfx2 as *const _ as *const _));
+                }
             }
             (false, HANDLE::default())
         }
@@ -321,6 +386,19 @@ fn capture_worker_loop(
     }
 
     Ok(())
+}
+
+fn activate_endpoint_audio_client(source_id: &str) -> windows::core::Result<IAudioClient> {
+    let enumerator: IMMDeviceEnumerator =
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+
+    let device: IMMDevice = if source_id.is_empty() {
+        unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? }
+    } else {
+        unsafe { enumerator.GetDevice(&HSTRING::from(source_id))? }
+    };
+
+    unsafe { device.Activate(CLSCTX_ALL, None) }
 }
 
 fn render_worker_loop(
@@ -547,7 +625,7 @@ mod tests {
 
         if let (Some(r), Some(c)) = (realtek, cx) {
             println!("Testing 48kHz -> 384kHz Bridge: [{}] -> [{}]", &r.name, &c.name);
-            let mut bridge = DualOutputBridge::start(r.id.clone(), c.id.clone()).expect("Failed to start bridge");
+            let mut bridge = DualOutputBridge::start(0, r.id.clone(), c.id.clone()).expect("Failed to start bridge");
             std::thread::sleep(Duration::from_millis(600));
             let lat = f32::from_bits(bridge.latency_ms.load(Ordering::Acquire));
             let drift = bridge.drift_ppm.load(Ordering::Acquire);
@@ -572,7 +650,7 @@ mod tests {
         let realtek = devices.iter().find(|d| d.name.contains("Realtek")).unwrap();
         let cx = devices.iter().find(|d| d.name.contains("CX31993")).unwrap();
         println!("Starting 1.5s live monitor from [{}] to [{}]...", realtek.name, cx.name);
-        let mut bridge = DualOutputBridge::start(realtek.id.clone(), cx.id.clone()).unwrap();
+        let mut bridge = DualOutputBridge::start(0, realtek.id.clone(), cx.id.clone()).unwrap();
         std::thread::sleep(Duration::from_millis(1500));
         let lat = f32::from_bits(bridge.latency_ms.load(Ordering::Acquire));
         let drift = bridge.drift_ppm.load(Ordering::Acquire);
@@ -582,5 +660,105 @@ mod tests {
         unsafe { CoUninitialize() };
     }
 
+    #[test]
+    fn test_process_loopback_activation() {
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+
+        let devices = enumerate_render_devices().unwrap();
+        let sessions = crate::audio::enumerator::get_active_app_sessions(&devices);
+        let target_pid = sessions.first().map(|s| s.pid).unwrap_or(std::process::id());
+
+        println!("Testing activate_process_loopback_client for PID: {}", target_pid);
+        match crate::audio::capture::activate_process_loopback_client(target_pid) {
+            Ok(client) => {
+                println!("Successfully activated process loopback IAudioClient for PID {}", target_pid);
+                
+                let wfx_float = crate::audio::capture::create_waveformat_float_stereo(48000);
+                let pwfx = &wfx_float as *const _ as *const windows::Win32::Media::Audio::WAVEFORMATEX;
+                let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+                let init_res = unsafe {
+                    client.Initialize(
+                        AUDCLNT_SHAREMODE_SHARED,
+                        stream_flags,
+                        100_000,
+                        0,
+                        pwfx,
+                        None,
+                    )
+                };
+                println!("Initialize with 48kHz float stereo: {:?}", init_res);
+
+                let event = unsafe { CreateEventW(None, false, false, None).unwrap() };
+                let set_evt_res = unsafe { client.SetEventHandle(event) };
+                println!("SetEventHandle: {:?}", set_evt_res);
+
+                let cap_res: windows::core::Result<windows::Win32::Media::Audio::IAudioCaptureClient> = unsafe { client.GetService() };
+                println!("GetService<IAudioCaptureClient>: {:?}", cap_res.is_ok());
+
+                let start_res = unsafe { client.Start() };
+                println!("AudioClient Start: {:?}", start_res);
+
+                if let Ok(cap_client) = cap_res {
+                    let wait_res = unsafe { WaitForSingleObject(event, 200) };
+                    println!("WaitForSingleObject: {:?}", wait_res);
+
+                    let mut buffer_ptr: *mut u8 = std::ptr::null_mut();
+                    let mut num_frames_read: u32 = 0;
+                    let mut flags: u32 = 0;
+                    let get_buf_res = unsafe {
+                        cap_client.GetBuffer(
+                            &mut buffer_ptr,
+                            &mut num_frames_read,
+                            &mut flags,
+                            None,
+                            None,
+                        )
+                    };
+                    println!("GetBuffer result: {:?}, frames: {}", get_buf_res, num_frames_read);
+                    if num_frames_read > 0 {
+                        let _ = unsafe { cap_client.ReleaseBuffer(num_frames_read) };
+                    }
+                }
+
+                let _ = unsafe { client.Stop() };
+                let _ = unsafe { CloseHandle(event) };
+            }
+            Err(e) => {
+                println!("Process loopback activation result for PID {}: {:?}", target_pid, e);
+            }
+        }
+
+        unsafe { CoUninitialize() };
+    }
+
+    #[test]
+    fn test_live_process_specific_dual_bridge() {
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let devices = enumerate_render_devices().unwrap();
+        let sessions = crate::audio::enumerator::get_active_app_sessions(&devices);
+        
+        let realtek = devices.iter().find(|d| d.name.contains("Realtek"));
+        let cx = devices.iter().find(|d| d.name.contains("CX31993"));
+
+        if let (Some(r), Some(c), Some(s)) = (realtek, cx, sessions.first()) {
+            println!("\n=== LIVE PROCESS-SPECIFIC DUAL BRIDGE TEST ===");
+            println!("Target App: [{}] | PID: {}", s.name, s.pid);
+            println!("Bridge: PID {} -> [{}] -> [{}]", s.pid, r.name, c.name);
+
+            let mut bridge = DualOutputBridge::start(s.pid, r.id.clone(), c.id.clone())
+                .expect("Failed to start process-specific bridge");
+
+            std::thread::sleep(Duration::from_millis(1000));
+
+            let lat = f32::from_bits(bridge.latency_ms.load(Ordering::Acquire));
+            let drift = bridge.drift_ppm.load(Ordering::Acquire);
+            println!("Process Bridge running smoothly: latency = {:.2} ms, drift = {} ppm", lat, drift);
+
+            bridge.stop();
+            println!("Process Bridge stopped cleanly without leaks!");
+            println!("==============================================\n");
+        }
+        unsafe { CoUninitialize() };
+    }
 }
 

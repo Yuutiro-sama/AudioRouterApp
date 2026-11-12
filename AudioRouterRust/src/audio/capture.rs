@@ -5,22 +5,25 @@
 //! Also provides structures for process-specific loopback (Windows 10 2004+ / Windows 11).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use windows::core::PCWSTR;
+use windows::core::{implement, Interface, HRESULT, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, WAVEFORMATEXTENSIBLE,
+    eConsole, eRender, ActivateAudioInterfaceAsync, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, IActivateAudioInterfaceAsyncOperation,
+    IActivateAudioInterfaceCompletionHandler,
+    IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient,
+    IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+    WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
 use crate::audio::render::{
     set_mmcss_pro_audio, RenderTargetState, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
@@ -55,6 +58,164 @@ pub enum AudioClientActivationType {
 pub struct AudioClientActivationParams {
     pub activation_type: AudioClientActivationType,
     pub process_loopback_params: AudioClientProcessLoopbackParams,
+}
+
+#[repr(C)]
+struct Blob {
+    cb_size: u32,
+    p_blob_data: *mut u8,
+}
+
+#[repr(C)]
+struct PropVariantBlob {
+    vt: u16,
+    w_reserved1: u16,
+    w_reserved2: u16,
+    w_reserved3: u16,
+    blob: Blob,
+}
+
+#[implement(IActivateAudioInterfaceCompletionHandler)]
+struct ProcessLoopbackActivationHandler {
+    event: HANDLE,
+    result: Arc<Mutex<Option<windows_core::Result<IAudioClient>>>>,
+}
+
+impl IActivateAudioInterfaceCompletionHandler_Impl for ProcessLoopbackActivationHandler_Impl {
+    fn ActivateCompleted(
+        &self,
+        activateoperation: Option<&IActivateAudioInterfaceAsyncOperation>,
+    ) -> windows_core::Result<()> {
+        let res = (|| -> windows_core::Result<IAudioClient> {
+            let op = activateoperation.ok_or_else(|| windows_core::Error::from_win32())?;
+            let mut hr = HRESULT(0);
+            let mut unk: Option<windows_core::IUnknown> = None;
+            unsafe {
+                op.GetActivateResult(&mut hr, &mut unk)?;
+            }
+            hr.ok()?;
+            let unk = unk.ok_or_else(|| windows_core::Error::from_win32())?;
+            unk.cast::<IAudioClient>()
+        })();
+
+        if let Ok(mut lock) = self.result.lock() {
+            *lock = Some(res);
+        }
+        unsafe {
+            let _ = SetEvent(self.event);
+        }
+        Ok(())
+    }
+}
+
+/// Asynchronously activates a process-specific loopback `IAudioClient` targeting `target_pid`.
+/// Uses `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK` ("VAD\\Process_Loopback") and
+/// `AUDIOCLIENT_ACTIVATION_PARAMS` (`PROCESS_LOOPBACK_MODE_INCLUDE_PROCESS_TREE`).
+pub fn activate_process_loopback_client(target_pid: u32) -> windows_core::Result<IAudioClient> {
+    let mut params = AudioClientActivationParams {
+        activation_type: AudioClientActivationType::ProcessLoopback,
+        process_loopback_params: AudioClientProcessLoopbackParams {
+            target_process_id: target_pid,
+            process_loopback_mode: ProcessLoopbackMode::IncludeTargetProcessTree,
+        },
+    };
+
+    let pv = PropVariantBlob {
+        vt: 65, // VT_BLOB
+        w_reserved1: 0,
+        w_reserved2: 0,
+        w_reserved3: 0,
+        blob: Blob {
+            cb_size: std::mem::size_of::<AudioClientActivationParams>() as u32,
+            p_blob_data: &mut params as *mut _ as *mut u8,
+        },
+    };
+
+    let propvar = std::mem::ManuallyDrop::new(unsafe {
+        std::mem::transmute::<PropVariantBlob, windows_core::PROPVARIANT>(pv)
+    });
+
+    let event = unsafe { CreateEventW(None, false, false, None)? };
+    let result_holder = Arc::new(Mutex::new(None));
+
+    let handler: IActivateAudioInterfaceCompletionHandler = ProcessLoopbackActivationHandler {
+        event,
+        result: result_holder.clone(),
+    }
+    .into();
+
+    let _async_op = unsafe {
+        ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+            &IAudioClient::IID,
+            Some(&*propvar),
+            &handler,
+        )?
+    };
+
+    let wait_res = unsafe { WaitForSingleObject(event, 3000) };
+    let _ = unsafe { CloseHandle(event) };
+
+    if wait_res != WAIT_OBJECT_0 {
+        return Err(windows_core::Error::new(
+            HRESULT(-2147023436), // 0x80070102 = WAIT_TIMEOUT
+            "ActivateAudioInterfaceAsync timed out waiting for completion handler",
+        ));
+    }
+
+    let mut lock = result_holder.lock().map_err(|_| {
+        windows_core::Error::new(HRESULT(-2147467259), "Mutex poisoned")
+    })?;
+
+    lock.take().unwrap_or_else(|| {
+        Err(windows_core::Error::new(
+            HRESULT(-2147467259),
+            "No activation result received from completion handler",
+        ))
+    })
+}
+
+/// Creates a standard stereo IEEE float WAVEFORMATEXTENSIBLE structure.
+pub fn create_waveformat_float_stereo(sample_rate: u32) -> WAVEFORMATEXTENSIBLE {
+    let channels = 2u16;
+    let bits_per_sample = 32u16;
+    let block_align = channels * (bits_per_sample / 8);
+    let avg_bytes_per_sec = sample_rate * (block_align as u32);
+
+    WAVEFORMATEXTENSIBLE {
+        Format: windows::Win32::Media::Audio::WAVEFORMATEX {
+            wFormatTag: 0xFFFE, // WAVE_FORMAT_EXTENSIBLE
+            nChannels: channels,
+            nSamplesPerSec: sample_rate,
+            nAvgBytesPerSec: avg_bytes_per_sec,
+            nBlockAlign: block_align,
+            wBitsPerSample: bits_per_sample,
+            cbSize: 22,
+        },
+        Samples: windows::Win32::Media::Audio::WAVEFORMATEXTENSIBLE_0 {
+            wValidBitsPerSample: bits_per_sample,
+        },
+        dwChannelMask: 3, // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT
+        SubFormat: KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+    }
+}
+
+/// Creates a standard 16-bit integer PCM WAVEFORMATEX structure.
+pub fn create_waveformat_pcm_stereo(sample_rate: u32) -> windows::Win32::Media::Audio::WAVEFORMATEX {
+    let channels = 2u16;
+    let bits_per_sample = 16u16;
+    let block_align = channels * (bits_per_sample / 8);
+    let avg_bytes_per_sec = sample_rate * (block_align as u32);
+
+    windows::Win32::Media::Audio::WAVEFORMATEX {
+        wFormatTag: 1, // WAVE_FORMAT_PCM
+        nChannels: channels,
+        nSamplesPerSec: sample_rate,
+        nAvgBytesPerSec: avg_bytes_per_sec,
+        nBlockAlign: block_align,
+        wBitsPerSample: bits_per_sample,
+        cbSize: 0,
+    }
 }
 
 /// Spawns the master WASAPI loopback worker thread.
