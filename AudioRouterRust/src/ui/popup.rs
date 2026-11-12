@@ -295,10 +295,10 @@ pub fn calculate_flyout_position(width: i32, height: i32, tray_rect: Option<RECT
                 let cy = tr.top - height - 8;
                 (cx, cy)
             }
-                        None => {
-                // Default to bottom-right corner above taskbar
-                let cx = work.right - width - margin;
-                let cy = work.bottom - height - margin;
+            None => {
+                // If launched directly without tray click, center on active monitor for clear visibility
+                let cx = work.left + (work.right - work.left - width) / 2;
+                let cy = work.top + (work.bottom - work.top - height) / 2;
                 (cx, cy)
             }
         };

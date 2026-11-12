@@ -183,7 +183,9 @@ unsafe extern "system" fn dispatcher_wndproc(
                 data.app_state.apply_all_rules(false);
             } else if wparam.0 == TIMER_ID_TRAY_RETRY {
                 if !data.tray_icon.is_added {
-                    if data.tray_icon.add().is_ok() {
+                    let res = data.tray_icon.add();
+                    debug_log(&format!("TIMER_ID_TRAY_RETRY: add() result = {:?}", res));
+                    if res.is_ok() {
                         let _ = KillTimer(hwnd, TIMER_ID_TRAY_RETRY);
                     }
                 } else {
