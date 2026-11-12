@@ -194,6 +194,7 @@ unsafe extern "system" fn dispatcher_wndproc(
         }
 
         WM_DESTROY => {
+            debug_log("dispatcher_wndproc: WM_DESTROY received, posting quit message");
             let _ = data.tray_icon.remove();
             let _ = Box::from_raw(data_ptr);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -224,32 +225,40 @@ fn main() -> windows::core::Result<()> {
     let mutex_name = w!("AudioRouterApp_SingleInstance");
     let mutex_handle = unsafe { CreateMutexW(None, true, mutex_name) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        debug_log("Instance already exists, sending IDM_SHOW_UI and exiting");
+        debug_log("Instance already exists, waking existing UI and exiting");
         unsafe {
-            let broadcast_msg = windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(w!("AudioRouter_ShowUI"));
-            if broadcast_msg != 0 {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    windows::Win32::UI::WindowsAndMessaging::HWND_BROADCAST,
-                    broadcast_msg,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
-            }
+            use windows::Win32::UI::WindowsAndMessaging::*;
+            let broadcast_msg = RegisterWindowMessageW(w!("AudioRouter_ShowUI"));
 
-            let _ = windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
-            let existing_hwnd = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
+            let existing_hwnd = FindWindowW(
                 w!("AudioRouterDispatcherClass"),
-                None,
+                w!("AudioRouterDispatcher"),
             );
             if let Ok(h) = existing_hwnd {
                 if !h.is_invalid() && !h.0.is_null() {
-                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    let mut pid = 0u32;
+                    let _ = GetWindowThreadProcessId(h, Some(&mut pid));
+                    if pid > 0 {
+                        let _ = AllowSetForegroundWindow(pid);
+                    }
+                    if broadcast_msg != 0 {
+                        let _ = PostMessageW(h, broadcast_msg, WPARAM(0), LPARAM(0));
+                    }
+                    let _ = PostMessageW(
                         h,
-                        windows::Win32::UI::WindowsAndMessaging::WM_COMMAND,
+                        WM_COMMAND,
                         WPARAM(crate::ipc_messages::IDM_SHOW_UI as usize),
                         LPARAM(0),
                     );
                 }
+            }
+            if broadcast_msg != 0 {
+                let _ = PostMessageW(
+                    HWND_BROADCAST,
+                    broadcast_msg,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
             }
         }
         return Ok(());
@@ -354,6 +363,12 @@ fn main() -> windows::core::Result<()> {
 
     // Attach state to window user data
     let show_ui_msg = unsafe { windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(w!("AudioRouter_ShowUI")) };
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let _ = ChangeWindowMessageFilterEx(hwnd, show_ui_msg, MSGFLT_ALLOW, None);
+        let _ = ChangeWindowMessageFilterEx(hwnd, WM_COMMAND, MSGFLT_ALLOW, None);
+        let _ = ChangeWindowMessageFilterEx(hwnd, taskbar_created_msg, MSGFLT_ALLOW, None);
+    }
     let dispatcher_data = Box::new(DispatcherData {
         app_state,
         tray_icon,
@@ -392,6 +407,7 @@ fn main() -> windows::core::Result<()> {
     }
 
     // 7. Message Loop
+    debug_log("Entering message loop");
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -399,6 +415,7 @@ fn main() -> windows::core::Result<()> {
             DispatchMessageW(&msg);
         }
     }
+    debug_log(&format!("Message loop exited with msg: 0x{:X}", msg.message));
 
     // 8. Cleanup COM & Mutex
     unsafe {
@@ -409,6 +426,7 @@ fn main() -> windows::core::Result<()> {
             }
         }
     }
+    debug_log("AudioRouter main() returning Ok(())");
 
     Ok(())
 }

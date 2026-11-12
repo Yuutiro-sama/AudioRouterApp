@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Gdi::{
     HBRUSH, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::ProcessStatus::K32EmptyWorkingSet;
-use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcess, GetCurrentProcessId};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, SetScrollInfo, DRAWITEMSTRUCT, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES,
     INITCOMMONCONTROLSEX, ODS_SELECTED, TBM_SETPOS, TBM_SETRANGE, TBS_AUTOTICKS, TBS_HORZ,
@@ -26,11 +26,12 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE};
 use windows::Win32::UI::Shell::{DefSubclassProc, ExtractIconExW, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, CreateWindowExW, DefWindowProcW, DeferWindowPos, DestroyIcon,
-    DestroyWindow, EndDeferWindowPos, GetClientRect, GetCursorPos, GetDlgCtrlID, GetParent,
-    GetScrollInfo, GetWindowLongPtrW, GetWindowThreadProcessId, PostMessageW, RegisterClassExW,
-    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowWindow, IsWindow, IsWindowVisible, SW_HIDE, WM_CLOSE,
+    BeginDeferWindowPos, BringWindowToTop, CreateWindowExW, DefWindowProcW,
+    DeferWindowPos, DestroyIcon, DestroyWindow, EndDeferWindowPos, GetClientRect, GetCursorPos,
+    GetDlgCtrlID, GetForegroundWindow, GetParent, GetScrollInfo, GetWindowLongPtrW,
+    GetWindowThreadProcessId, HWND_TOPMOST, PostMessageW, RegisterClassExW, SendMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    IsWindow, IsWindowVisible, SW_HIDE, SWP_SHOWWINDOW, WM_CLOSE,
     GetSystemMetrics, LoadImageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED,
     SM_CXICON, SM_CYICON, SM_CXSMICON, SM_CYSMICON, WM_SETICON,
     BN_CLICKED, BS_OWNERDRAW, CBS_DROPDOWNLIST, CBN_CLOSEUP, CBN_DROPDOWN,
@@ -170,6 +171,7 @@ struct ChildLayout {
 
 struct FlyoutState {
     created_at: std::time::Instant,
+    has_focused: bool,
     owner_hwnd: HWND,
     container_hwnd: HWND,
     scale: f32,
@@ -629,12 +631,12 @@ pub fn toggle_flyout(
         let (final_x, final_y) = calculate_flyout_position(width, total_height, tray_rect);
         let _ = SetWindowPos(
             hwnd,
-            HWND::default(),
+            HWND_TOPMOST,
             final_x,
             final_y,
             width,
             total_height,
-            windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS(0),
+            SWP_SHOWWINDOW,
         );
 
         // Typography: Title 16pt Bold, App Name 14pt Bold, Labels 12pt Bold, Text 12pt, PID 11pt
@@ -1158,6 +1160,7 @@ pub fn toggle_flyout(
 
         let state = Box::new(FlyoutState {
             created_at: std::time::Instant::now(),
+            has_focused: false,
             owner_hwnd,
             container_hwnd,
             scale,
@@ -1184,9 +1187,27 @@ pub fn toggle_flyout(
 
         let s_res = ShowWindow(hwnd, SW_SHOW);
         let u_res = UpdateWindow(hwnd);
-        let f_res = SetForegroundWindow(hwnd);
-        let foc_res = SetFocus(hwnd);
-        crate::debug_log(&format!("ShowWindow: show={:?}, update={:?}, foreground={:?}, focus={:?}", s_res, u_res, f_res, foc_res));
+        let fore_hwnd = GetForegroundWindow();
+        if !fore_hwnd.is_invalid() && !fore_hwnd.0.is_null() && fore_hwnd != hwnd {
+            let fore_thread = GetWindowThreadProcessId(fore_hwnd, None);
+            let cur_thread = windows::Win32::System::Threading::GetCurrentThreadId();
+            if fore_thread != cur_thread {
+                let _ = AttachThreadInput(fore_thread, cur_thread, true);
+                let _ = BringWindowToTop(hwnd);
+                let _ = SetForegroundWindow(hwnd);
+                let _ = SetFocus(hwnd);
+                let _ = AttachThreadInput(fore_thread, cur_thread, false);
+            } else {
+                let _ = BringWindowToTop(hwnd);
+                let _ = SetForegroundWindow(hwnd);
+                let _ = SetFocus(hwnd);
+            }
+        } else {
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetFocus(hwnd);
+        }
+        crate::debug_log(&format!("ShowWindow: show={:?}, update={:?}", s_res, u_res));
     }
 }
 
@@ -1199,38 +1220,40 @@ unsafe extern "system" fn flyout_wndproc(
     let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut FlyoutState;
 
     match msg {
-                        WM_ACTIVATE => {
+        WM_ACTIVATE => {
             let active_state = (wparam.0 as u32) & 0xFFFF;
-            if active_state == WA_INACTIVE as u32 {
+            if active_state != WA_INACTIVE as u32 {
                 if !state_ptr.is_null() {
-                    let state = &*state_ptr;
-                    // Do not close within 600ms of creation to avoid startup activation race
-                    if state.created_at.elapsed().as_millis() < 600 {
-                        return LRESULT(0);
-                    }
+                    let state = &mut *state_ptr;
+                    state.has_focused = true;
                 }
-                let other_hwnd = HWND(lparam.0 as _);
-                if !other_hwnd.is_invalid() && !other_hwnd.0.is_null() {
-                    let mut target_pid = 0u32;
-                    unsafe {
-                        GetWindowThreadProcessId(other_hwnd, Some(&mut target_pid));
-                    }
-                    let current_pid = unsafe { GetCurrentProcessId() };
-                    if target_pid == current_pid {
-                        return LRESULT(0);
-                    }
-                }
-
-                if !state_ptr.is_null() {
-                    let state = &*state_ptr;
-                    if state.is_dropdown_open {
-                        return LRESULT(0);
-                    }
-                }
-
-                close_flyout();
                 return LRESULT(0);
             }
+
+            if !state_ptr.is_null() {
+                let state = &*state_ptr;
+                // Only dismiss if the window has been focused at least once,
+                // and at least 800ms has elapsed since creation to avoid race conditions.
+                if !state.has_focused || state.created_at.elapsed().as_millis() < 800 {
+                    return LRESULT(0);
+                }
+                if state.is_dropdown_open {
+                    return LRESULT(0);
+                }
+            }
+            let other_hwnd = HWND(lparam.0 as _);
+            if !other_hwnd.is_invalid() && !other_hwnd.0.is_null() {
+                let mut target_pid = 0u32;
+                unsafe {
+                    GetWindowThreadProcessId(other_hwnd, Some(&mut target_pid));
+                }
+                let current_pid = unsafe { GetCurrentProcessId() };
+                if target_pid == current_pid {
+                    return LRESULT(0);
+                }
+            }
+
+            close_flyout();
             return LRESULT(0);
         }
 
