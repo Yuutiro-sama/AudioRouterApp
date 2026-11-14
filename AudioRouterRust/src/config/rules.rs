@@ -572,12 +572,10 @@ pub fn get_config_v3_path() -> PathBuf {
     get_appdata_dir().join("rules_v3.json")
 }
 
-/// Tải cấu hình v3 từ `%AppData%\AudioRouter\rules_v3.json`.
-/// Tự động nâng cấp / migration từ `rules.json` cũ nếu `rules_v3.json` chưa tồn tại.
-pub fn load_config_v3() -> ConfigV3 {
-    let path = get_config_v3_path();
+/// Tải cấu hình v3 từ một đường dẫn tùy chọn.
+pub fn load_config_v3_from_path(path: &std::path::Path) -> Option<ConfigV3> {
     if path.exists() {
-        if let Ok(contents) = std::fs::read_to_string(&path) {
+        if let Ok(contents) = std::fs::read_to_string(path) {
             if let Ok(mut cfg) = serde_json::from_str::<ConfigV3>(&contents) {
                 // If apps is empty but legacy app_rules has entries, populate apps
                 if cfg.apps.is_empty() && !cfg.app_rules.is_empty() {
@@ -597,9 +595,19 @@ pub fn load_config_v3() -> ConfigV3 {
                     }
                 }
                 cfg.sanitize();
-                return cfg;
+                return Some(cfg);
             }
         }
+    }
+    None
+}
+
+/// Tải cấu hình v3 từ `%AppData%\AudioRouter\rules_v3.json`.
+/// Tự động nâng cấp / migration từ `rules.json` cũ nếu `rules_v3.json` chưa tồn tại.
+pub fn load_config_v3() -> ConfigV3 {
+    let path = get_config_v3_path();
+    if let Some(cfg) = load_config_v3_from_path(&path) {
+        return cfg;
     }
 
     // Migration từ rules.json cũ nếu có
@@ -641,12 +649,11 @@ pub fn load_or_init_config_v3(default_dev_id: Option<&str>) -> ConfigV3 {
     cfg
 }
 
-/// Atomically saves ConfigV3 to `%AppData%\AudioRouter\rules_v3.json`.
+/// Atomically saves ConfigV3 to a specified path.
 /// Uses a temporary file (.tmp), calls `sync_all` to flush buffers,
 /// and atomically swaps the destination via `MoveFileExW`
 /// (`MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`).
-pub fn save_config_v3(config: &ConfigV3) -> std::io::Result<()> {
-    let target_path = get_config_v3_path();
+pub fn save_config_v3_to_path(config: &ConfigV3, target_path: &std::path::Path) -> std::io::Result<()> {
     if let Some(parent) = target_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -679,12 +686,17 @@ pub fn save_config_v3(config: &ConfigV3) -> std::io::Result<()> {
 
         if res.is_err() {
             // Fallback to standard remove + rename if MoveFileExW fails
-            let _ = std::fs::remove_file(&target_path);
-            std::fs::rename(&tmp_path, &target_path)?;
+            let _ = std::fs::remove_file(target_path);
+            std::fs::rename(&tmp_path, target_path)?;
         }
     }
 
     Ok(())
+}
+
+/// Atomically saves ConfigV3 to `%AppData%\AudioRouter\rules_v3.json`.
+pub fn save_config_v3(config: &ConfigV3) -> std::io::Result<()> {
+    save_config_v3_to_path(config, &get_config_v3_path())
 }
 
 /// Loads legacy rules mapping (`app_exe_name` -> `device_id`) from `%AppData%\AudioRouter\rules.json`.
@@ -893,23 +905,23 @@ mod tests {
 
     #[test]
     fn test_config_v3_atomic_save_and_load() {
-        let mut cfg = load_config_v3();
+        let temp_dir = std::env::temp_dir().join(format!("audiorouter_test_{}", std::process::id()));
+        let test_path = temp_dir.join("test_rules_v3.json");
+        let mut cfg = ConfigV3::new();
         let test_dev = "{test-guid-unit-test}";
         cfg.set_device_enabled(test_dev.into(), true);
         cfg.set_device_volume(test_dev.into(), 0.42);
 
-        let res = save_config_v3(&cfg);
-        assert!(res.is_ok());
+        let res = save_config_v3_to_path(&cfg, &test_path);
+        assert!(res.is_ok(), "Save failed: {:?}", res);
 
-        let reloaded = load_config_v3();
+        let reloaded = load_config_v3_from_path(&test_path).expect("Failed to reload saved config");
         assert!(reloaded.is_device_enabled(test_dev));
         assert_eq!(reloaded.get_device_volume(test_dev), 0.42);
 
         // Cleanup
-        let mut cleanup = reloaded;
-        cleanup.set_device_enabled(test_dev.into(), false);
-        cleanup.device_volumes.remove(test_dev);
-        let _ = save_config_v3(&cleanup);
+        let _ = std::fs::remove_file(&test_path);
+        let _ = std::fs::remove_dir(&temp_dir);
     }
 
     #[test]

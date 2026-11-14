@@ -437,10 +437,15 @@ fn render_worker_loop(
     unsafe {
         let _ = audio_client.GetDevicePeriod(Some(&mut default_period), None);
     }
-    let buffer_duration = if default_period > 0 {
+    let base_period = if default_period > 0 {
         default_period
     } else {
         100_000 // 10ms
+    };
+    let buffer_duration = if sample_rate >= 192000 {
+        (base_period * 3).max(350_000) // ~35ms-40ms hardware triple-buffer for ultra high-res
+    } else {
+        (base_period * 2).max(200_000)
     };
 
     unsafe {
@@ -475,18 +480,18 @@ fn render_worker_loop(
         in_rate = 48000;
     }
 
-    let target_latency_ms = if sample_rate >= 192000 { 25 } else { 20 };
+    let target_latency_ms = if sample_rate >= 192000 { 40 } else { 20 };
     let mut dsp = AdaptiveResamplerDsp::new(in_rate, sample_rate, target_latency_ms);
 
     // Pre-Roll Buffer Priming:
     // Ensure capture thread primes the ring buffer with at least `dsp.target_fill_frames()`
-    // (with a max timeout of 150ms to prevent hanging if the source is silent/idle).
+    // (with a max timeout of 300ms to prevent hanging if the source is silent/idle).
     // This guarantees that high-rate render streams (especially 384kHz) start with
     // a generous cushion of frames, preventing initial buffer starvation/underrun glitches.
     let prime_start = std::time::Instant::now();
     let min_prime_frames = dsp.target_fill_frames();
     while (rb.available_read() / 2) < min_prime_frames
-        && prime_start.elapsed() < Duration::from_millis(150)
+        && prime_start.elapsed() < Duration::from_millis(300)
         && !stop_signal.load(Ordering::Relaxed)
     {
         std::thread::sleep(Duration::from_millis(2));

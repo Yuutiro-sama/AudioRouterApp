@@ -234,17 +234,17 @@ impl AdaptiveResamplerDsp {
         // Adjusts resampler step ratio to match the crystal oscillator of the output device.
         let error = (avail_frames as f64 - self.target_fill_frames as f64)
             / (self.target_fill_frames as f64);
-        self.integral_error = (self.integral_error + error).clamp(-50.0, 50.0);
+        self.integral_error = (self.integral_error + error).clamp(-150.0, 150.0);
 
-        let kp = 0.00025;
-        let ki = 0.0000015;
+        let kp = 0.0008;
+        let ki = 0.000008;
         // Dynamic drift range: allow faster drain if buffer is bloated (> 2x target)
-        let max_drift = if avail_frames > self.target_fill_frames * 2 { 1.02 } else { 1.005 };
-        let min_drift = if avail_frames < self.target_fill_frames / 2 { 0.98 } else { 0.995 };
+        let max_drift = if avail_frames > self.target_fill_frames * 2 { 1.02 } else { 1.008 };
+        let min_drift = if avail_frames < self.target_fill_frames / 2 { 0.98 } else { 0.992 };
         let raw_drift_adjust = (1.0 + kp * error + ki * self.integral_error).clamp(min_drift, max_drift);
 
-        // 1st-order Exponential Moving Average (EMA) filter on drift adjust
-        self.smoothed_drift = 0.95 * self.smoothed_drift + 0.05 * raw_drift_adjust;
+        // 1st-order Exponential Moving Average (EMA) filter on drift adjust (0.98 / 0.02)
+        self.smoothed_drift = 0.98 * self.smoothed_drift + 0.02 * raw_drift_adjust;
         self.last_drift_ppm = ((self.smoothed_drift - 1.0) * 1_000_000.0) as i32;
 
         let step = self.base_ratio * self.smoothed_drift;
@@ -328,10 +328,12 @@ impl AdaptiveResamplerDsp {
                 }
             }
 
-            self.phase += step;
-            let advance = self.phase as usize;
-            read_frame_cursor += advance;
-            self.phase -= advance as f64;
+            if read_frame_cursor < avail_frames {
+                self.phase += step;
+                let advance = self.phase as usize;
+                read_frame_cursor += advance;
+                self.phase -= advance as f64;
+            }
         }
 
         let consumed = read_frame_cursor.min(avail_frames);

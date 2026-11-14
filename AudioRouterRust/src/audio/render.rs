@@ -236,10 +236,15 @@ fn render_worker_loop(
     unsafe {
         let _ = audio_client.GetDevicePeriod(Some(&mut default_period), None);
     }
-    let buffer_duration = if default_period > 0 {
+    let base_period = if default_period > 0 {
         default_period
     } else {
         100_000 // 10ms in 100ns units
+    };
+    let buffer_duration = if sample_rate >= 192000 {
+        (base_period * 3).max(350_000) // ~35ms-40ms hardware triple-buffer for ultra high-res
+    } else {
+        (base_period * 2).max(200_000)
     };
 
     unsafe {
@@ -263,14 +268,37 @@ fn render_worker_loop(
     let render_client: IAudioRenderClient = unsafe { audio_client.GetService()? };
     let buffer_frame_count = unsafe { audio_client.GetBufferSize()? };
 
-    // Determine target latency: Bluetooth endpoints benefit from ~35ms, wired ~15ms
+    // Determine target latency: 384kHz DAC benefits from 40ms, Bluetooth ~35ms, wired 48k ~20ms
     let is_bluetooth = state.device_name.to_lowercase().contains("bluetooth")
         || state.device_name.to_lowercase().contains("a2dp")
         || state.device_name.to_lowercase().contains("hands-free")
         || state.device_name.to_lowercase().contains("wireless");
-    let target_latency_ms = if is_bluetooth { 35 } else { 15 };
+    let target_latency_ms = if sample_rate >= 192000 {
+        40
+    } else if is_bluetooth {
+        35
+    } else {
+        20
+    };
 
     let mut dsp = AdaptiveResamplerDsp::new(capture_sample_rate, sample_rate, target_latency_ms);
+
+    // Pre-Roll Buffer Priming:
+    // Wait until capture primes ring buffer with at least min_prime_frames
+    let prime_start = std::time::Instant::now();
+    let min_prime_frames = dsp.target_fill_frames();
+    while (state.ring_buffer.available_read() / 2) < min_prime_frames
+        && prime_start.elapsed() < Duration::from_millis(300)
+        && !stop_signal.load(Ordering::Relaxed)
+        && state.enabled.load(Ordering::Relaxed)
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    if stop_signal.load(Ordering::Relaxed) || !state.enabled.load(Ordering::Relaxed) {
+        let _ = unsafe { CloseHandle(event) };
+        return Ok(());
+    }
 
     // Prime the buffer with silence to start stream smoothly
     unsafe {
