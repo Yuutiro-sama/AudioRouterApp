@@ -475,7 +475,27 @@ fn render_worker_loop(
         in_rate = 48000;
     }
 
-    let mut dsp = AdaptiveResamplerDsp::new(in_rate, sample_rate, 20);
+    let target_latency_ms = if sample_rate >= 192000 { 25 } else { 20 };
+    let mut dsp = AdaptiveResamplerDsp::new(in_rate, sample_rate, target_latency_ms);
+
+    // Pre-Roll Buffer Priming:
+    // Ensure capture thread primes the ring buffer with at least `dsp.target_fill_frames()`
+    // (with a max timeout of 150ms to prevent hanging if the source is silent/idle).
+    // This guarantees that high-rate render streams (especially 384kHz) start with
+    // a generous cushion of frames, preventing initial buffer starvation/underrun glitches.
+    let prime_start = std::time::Instant::now();
+    let min_prime_frames = dsp.target_fill_frames();
+    while (rb.available_read() / 2) < min_prime_frames
+        && prime_start.elapsed() < Duration::from_millis(150)
+        && !stop_signal.load(Ordering::Relaxed)
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    if stop_signal.load(Ordering::Relaxed) {
+        let _ = unsafe { CloseHandle(event) };
+        return Ok(());
+    }
 
     // Prime the buffer with silence to start stream smoothly
     unsafe {
@@ -510,7 +530,7 @@ fn render_worker_loop(
         // Dynamically update input rate if it changed
         let cur_in_rate = source_rate.load(Ordering::Relaxed);
         if cur_in_rate > 0 && cur_in_rate != dsp.in_rate() {
-            dsp = AdaptiveResamplerDsp::new(cur_in_rate, sample_rate, 20);
+            dsp = AdaptiveResamplerDsp::new(cur_in_rate, sample_rate, target_latency_ms);
         }
 
         let target_vol = f32::from_bits(volume_bits.load(Ordering::Acquire));
