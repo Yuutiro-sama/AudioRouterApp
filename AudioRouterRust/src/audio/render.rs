@@ -19,6 +19,7 @@ use windows::Win32::Media::Audio::{
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
     IAudioClient, IAudioRenderClient, IMMDevice,
     IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEXTENSIBLE,
+    WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
@@ -33,6 +34,204 @@ use crate::audio::ring_buffer::SpscRingBuffer;
 /// Standard GUID for IEEE Float audio subformat: {00000003-0000-0010-8000-00AA00389B71}
 pub const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
     GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+
+/// Supported audio sample encoding on WASAPI output endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointSampleFormat {
+    Float32,
+    Pcm32Container24, // 32-bit container containing 24-bit (or 32-bit) integer PCM
+    Pcm24Packed,      // 24-bit packed: 3 bytes/sample (Little Endian)
+    Pcm16,
+}
+
+impl EndpointSampleFormat {
+    #[inline(always)]
+    pub fn bytes_per_sample(&self) -> usize {
+        match self {
+            EndpointSampleFormat::Float32 => 4,
+            EndpointSampleFormat::Pcm32Container24 => 4,
+            EndpointSampleFormat::Pcm24Packed => 3,
+            EndpointSampleFormat::Pcm16 => 2,
+        }
+    }
+}
+
+/// Reliably detects audio sample format from WASAPI WAVEFORMATEX/WAVEFORMATEXTENSIBLE pointer.
+pub unsafe fn detect_sample_format(pwfx: *const WAVEFORMATEX) -> EndpointSampleFormat {
+    if pwfx.is_null() {
+        return EndpointSampleFormat::Float32;
+    }
+    let wfx = &*pwfx;
+    let bits = wfx.wBitsPerSample;
+
+    // WAVE_FORMAT_IEEE_FLOAT = 0x0003, WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+    if wfx.wFormatTag == 0x0003 {
+        return EndpointSampleFormat::Float32;
+    }
+
+    if wfx.wFormatTag == 0xFFFE && wfx.cbSize >= 22 {
+        let wfxe = &*(pwfx as *const WAVEFORMATEXTENSIBLE);
+        let subformat = std::ptr::addr_of!((*wfxe).SubFormat).read_unaligned();
+        // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT GUID: 00000003-0000-0010-8000-00AA00389B71
+        if subformat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT || subformat.data1 == 0x00000003 {
+            return EndpointSampleFormat::Float32;
+        }
+    }
+
+    match bits {
+        32 => EndpointSampleFormat::Pcm32Container24,
+        24 => EndpointSampleFormat::Pcm24Packed,
+        16 => EndpointSampleFormat::Pcm16,
+        _ => EndpointSampleFormat::Float32,
+    }
+}
+
+/// Transfers and converts f32 samples [-1.0, 1.0] to native WASAPI DMA buffer format.
+pub unsafe fn write_frames_to_wasapi(
+    dst_ptr: *mut u8,
+    src_interleaved_f32: &[f32],
+    channels: usize,
+    format: EndpointSampleFormat,
+    volume: f32,
+) {
+    if channels == 0 || src_interleaved_f32.is_empty() || dst_ptr.is_null() {
+        return;
+    }
+
+    const SCALE_32: f64 = 2147483647.0;
+    const SCALE_24: f32 = 8388607.0;
+    const SCALE_16: f32 = 32767.0;
+
+    let is_multichannel_src = src_interleaved_f32.len() % channels == 0 && (channels != 2 || src_interleaved_f32.len() != 2);
+    let frames = if src_interleaved_f32.len() % channels == 0 {
+        src_interleaved_f32.len() / channels
+    } else {
+        src_interleaved_f32.len() / 2
+    };
+
+    let total_dest_samples = frames * channels;
+
+    match format {
+        EndpointSampleFormat::Float32 => {
+            let out_slice = std::slice::from_raw_parts_mut(dst_ptr as *mut f32, total_dest_samples);
+            if is_multichannel_src {
+                for i in 0..total_dest_samples {
+                    out_slice[i] = (src_interleaved_f32[i] * volume).clamp(-1.0, 1.0);
+                }
+            } else {
+                for i in 0..frames {
+                    let (l, r) = if channels == 1 {
+                        let m = ((src_interleaved_f32[i * 2] + src_interleaved_f32[i * 2 + 1]) * 0.5 * volume).clamp(-1.0, 1.0);
+                        (m, m)
+                    } else {
+                        (
+                            (src_interleaved_f32[i * 2] * volume).clamp(-1.0, 1.0),
+                            (src_interleaved_f32[i * 2 + 1] * volume).clamp(-1.0, 1.0),
+                        )
+                    };
+                    out_slice[i * channels] = l;
+                    if channels > 1 {
+                        out_slice[i * channels + 1] = r;
+                    }
+                    for ch in 2..channels {
+                        out_slice[i * channels + ch] = 0.0;
+                    }
+                }
+            }
+        }
+        EndpointSampleFormat::Pcm32Container24 => {
+            let out_slice = std::slice::from_raw_parts_mut(dst_ptr as *mut i32, total_dest_samples);
+            if is_multichannel_src {
+                for i in 0..total_dest_samples {
+                    let s = (src_interleaved_f32[i] * volume).clamp(-1.0, 1.0) as f64;
+                    out_slice[i] = ((s * SCALE_32) as i32) & !0xFF;
+                }
+            } else {
+                for i in 0..frames {
+                    let (l, r) = if channels == 1 {
+                        let m = ((src_interleaved_f32[i * 2] + src_interleaved_f32[i * 2 + 1]) * 0.5 * volume).clamp(-1.0, 1.0) as f64;
+                        (m, m)
+                    } else {
+                        (
+                            (src_interleaved_f32[i * 2] * volume).clamp(-1.0, 1.0) as f64,
+                            (src_interleaved_f32[i * 2 + 1] * volume).clamp(-1.0, 1.0) as f64,
+                        )
+                    };
+                    out_slice[i * channels] = ((l * SCALE_32) as i32) & !0xFF;
+                    if channels > 1 {
+                        out_slice[i * channels + 1] = ((r * SCALE_32) as i32) & !0xFF;
+                    }
+                    for ch in 2..channels {
+                        out_slice[i * channels + ch] = 0;
+                    }
+                }
+            }
+        }
+        EndpointSampleFormat::Pcm24Packed => {
+            let out_bytes = std::slice::from_raw_parts_mut(dst_ptr, total_dest_samples * 3);
+            if is_multichannel_src {
+                for i in 0..total_dest_samples {
+                    let val_f = (src_interleaved_f32[i] * volume).clamp(-1.0, 1.0);
+                    let val_i32 = (val_f * SCALE_24).round() as i32;
+                    let bytes = val_i32.to_le_bytes();
+                    let offset = i * 3;
+                    out_bytes[offset] = bytes[0];
+                    out_bytes[offset + 1] = bytes[1];
+                    out_bytes[offset + 2] = bytes[2];
+                }
+            } else {
+                for i in 0..frames {
+                    let samples = if channels == 1 {
+                        let m = ((src_interleaved_f32[i * 2] + src_interleaved_f32[i * 2 + 1]) * 0.5 * volume).clamp(-1.0, 1.0);
+                        [m, m]
+                    } else {
+                        [
+                            (src_interleaved_f32[i * 2] * volume).clamp(-1.0, 1.0),
+                            (src_interleaved_f32[i * 2 + 1] * volume).clamp(-1.0, 1.0),
+                        ]
+                    };
+                    for ch in 0..channels {
+                        let val_f = if ch < 2 { samples[ch] } else { 0.0 };
+                        let val_i32 = (val_f * SCALE_24).round() as i32;
+                        let bytes = val_i32.to_le_bytes();
+                        let offset = (i * channels + ch) * 3;
+                        out_bytes[offset] = bytes[0];
+                        out_bytes[offset + 1] = bytes[1];
+                        out_bytes[offset + 2] = bytes[2];
+                    }
+                }
+            }
+        }
+        EndpointSampleFormat::Pcm16 => {
+            let out_slice = std::slice::from_raw_parts_mut(dst_ptr as *mut i16, total_dest_samples);
+            if is_multichannel_src {
+                for i in 0..total_dest_samples {
+                    let s = (src_interleaved_f32[i] * volume).clamp(-1.0, 1.0);
+                    out_slice[i] = (s * SCALE_16).round() as i16;
+                }
+            } else {
+                for i in 0..frames {
+                    let (l, r) = if channels == 1 {
+                        let m = ((src_interleaved_f32[i * 2] + src_interleaved_f32[i * 2 + 1]) * 0.5 * volume).clamp(-1.0, 1.0);
+                        (m, m)
+                    } else {
+                        (
+                            (src_interleaved_f32[i * 2] * volume).clamp(-1.0, 1.0),
+                            (src_interleaved_f32[i * 2 + 1] * volume).clamp(-1.0, 1.0),
+                        )
+                    };
+                    out_slice[i * channels] = (l * SCALE_16).round() as i16;
+                    if channels > 1 {
+                        out_slice[i * channels + 1] = (r * SCALE_16).round() as i16;
+                    }
+                    for ch in 2..channels {
+                        out_slice[i * channels + ch] = 0;
+                    }
+                }
+            }
+        }
+    }
+}
 
 type PfnAvSetMmThreadCharacteristicsW =
     unsafe extern "system" fn(windows::core::PCWSTR, *mut u32) -> HANDLE;
@@ -82,7 +281,7 @@ impl RenderTargetState {
             volume_scalar_bits: AtomicU32::new(1.0f32.to_bits()),
             current_latency_ms: AtomicU32::new(0.0f32.to_bits()),
             clock_drift_ppm: AtomicI32::new(0),
-            ring_buffer: Arc::new(SpscRingBuffer::default()),
+            ring_buffer: Arc::new(SpscRingBuffer::new(524288)),
         }
     }
 
@@ -218,34 +417,18 @@ fn render_worker_loop(
     let pwfx = unsafe { audio_client.GetMixFormat()? };
     let sample_rate = unsafe { (*pwfx).nSamplesPerSec };
     let channels = unsafe { (*pwfx).nChannels as usize };
-    let bits_per_sample = unsafe { (*pwfx).wBitsPerSample };
-
-    let is_float = unsafe {
-        if (*pwfx).wFormatTag == 3 {
-            true
-        } else if (*pwfx).wFormatTag == 0xFFFE {
-            let ext = pwfx as *const WAVEFORMATEXTENSIBLE;
-            let subformat = std::ptr::addr_of!((*ext).SubFormat).read_unaligned();
-            subformat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-        } else {
-            false
-        }
-    };
+    let sample_format = unsafe { detect_sample_format(pwfx) };
 
     let mut default_period: i64 = 0;
-    unsafe {
-        let _ = audio_client.GetDevicePeriod(Some(&mut default_period), None);
-    }
+    let mut min_period: i64 = 0;
+    let _ = unsafe { audio_client.GetDevicePeriod(Some(&mut default_period), Some(&mut min_period)) };
     let base_period = if default_period > 0 {
         default_period
     } else {
         100_000 // 10ms in 100ns units
     };
-    let buffer_duration = if sample_rate >= 192000 {
-        (base_period * 3).max(350_000) // ~35ms-40ms hardware triple-buffer for ultra high-res
-    } else {
-        (base_period * 2).max(200_000)
-    };
+    // WASAPI Quadruple-Buffering: (base_period * 4).max(400_000) (minimum 40ms) for ALL devices
+    let buffer_duration = (base_period * 4).max(400_000);
 
     unsafe {
         audio_client.Initialize(
@@ -268,23 +451,12 @@ fn render_worker_loop(
     let render_client: IAudioRenderClient = unsafe { audio_client.GetService()? };
     let buffer_frame_count = unsafe { audio_client.GetBufferSize()? };
 
-    // Determine target latency: 384kHz DAC benefits from 40ms, Bluetooth ~35ms, wired 48k ~20ms
-    let is_bluetooth = state.device_name.to_lowercase().contains("bluetooth")
-        || state.device_name.to_lowercase().contains("a2dp")
-        || state.device_name.to_lowercase().contains("hands-free")
-        || state.device_name.to_lowercase().contains("wireless");
-    let target_latency_ms = if sample_rate >= 192000 {
-        40
-    } else if is_bluetooth {
-        35
-    } else {
-        20
-    };
-
+    // Unified target_latency_ms = 40ms for ALL audio devices
+    let target_latency_ms: u32 = 40;
     let mut dsp = AdaptiveResamplerDsp::new(capture_sample_rate, sample_rate, target_latency_ms);
 
     // Pre-Roll Buffer Priming:
-    // Wait until capture primes ring buffer with at least min_prime_frames
+    // Wait until capture primes ring buffer with at least min_prime_frames (max 300ms)
     let prime_start = std::time::Instant::now();
     let min_prime_frames = dsp.target_fill_frames();
     while (state.ring_buffer.available_read() / 2) < min_prime_frames
@@ -303,7 +475,7 @@ fn render_worker_loop(
     // Prime the buffer with silence to start stream smoothly
     unsafe {
         let initial_buf = render_client.GetBuffer(buffer_frame_count)?;
-        let bytes_per_sample = (bits_per_sample as usize) / 8;
+        let bytes_per_sample = sample_format.bytes_per_sample();
         std::ptr::write_bytes(initial_buf, 0, (buffer_frame_count as usize) * channels * bytes_per_sample);
         render_client.ReleaseBuffer(buffer_frame_count, 0)?;
         audio_client.Start()?;
@@ -357,25 +529,14 @@ fn render_worker_loop(
             muted,
         );
 
-        if is_float && bits_per_sample == 32 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    intermediate_f32.as_ptr() as *const u8,
-                    dest_ptr,
-                    total_samples * std::mem::size_of::<f32>(),
-                );
-            }
-        } else if bits_per_sample == 16 {
-            let dest_slice =
-                unsafe { std::slice::from_raw_parts_mut(dest_ptr as *mut i16, total_samples) };
-            for (i, &s) in intermediate_f32[..total_samples].iter().enumerate() {
-                dest_slice[i] = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-            }
-        } else {
-            let bytes_per_sample = (bits_per_sample as usize) / 8;
-            unsafe {
-                std::ptr::write_bytes(dest_ptr, 0, total_samples * bytes_per_sample);
-            }
+        unsafe {
+            write_frames_to_wasapi(
+                dest_ptr,
+                &intermediate_f32[..total_samples],
+                channels,
+                sample_format,
+                1.0,
+            );
         }
 
         let _ = unsafe { render_client.ReleaseBuffer(frames_needed, 0) };
@@ -385,4 +546,152 @@ fn render_worker_loop(
     let _ = unsafe { CloseHandle(event) };
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_sample_format_float() {
+        let wfx = WAVEFORMATEX {
+            wFormatTag: 3, // IEEE_FLOAT
+            nChannels: 2,
+            nSamplesPerSec: 48000,
+            nAvgBytesPerSec: 48000 * 2 * 4,
+            nBlockAlign: 8,
+            wBitsPerSample: 32,
+            cbSize: 0,
+        };
+        let fmt = unsafe { detect_sample_format(&wfx) };
+        assert_eq!(fmt, EndpointSampleFormat::Float32);
+
+        // WAVEFORMATEXTENSIBLE IEEE_FLOAT
+        let wfxe = WAVEFORMATEXTENSIBLE {
+            Format: WAVEFORMATEX {
+                wFormatTag: 0xFFFE,
+                nChannels: 2,
+                nSamplesPerSec: 384000,
+                nAvgBytesPerSec: 384000 * 2 * 4,
+                nBlockAlign: 8,
+                wBitsPerSample: 32,
+                cbSize: 22,
+            },
+            Samples: Default::default(),
+            dwChannelMask: 3,
+            SubFormat: KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+        };
+        let fmt2 = unsafe { detect_sample_format(&wfxe.Format) };
+        assert_eq!(fmt2, EndpointSampleFormat::Float32);
+    }
+
+    #[test]
+    fn test_detect_sample_format_pcm_types() {
+        // 32-bit container PCM
+        let wfx32 = WAVEFORMATEX {
+            wFormatTag: 1,
+            nChannels: 2,
+            nSamplesPerSec: 48000,
+            nAvgBytesPerSec: 48000 * 2 * 4,
+            nBlockAlign: 8,
+            wBitsPerSample: 32,
+            cbSize: 0,
+        };
+        assert_eq!(unsafe { detect_sample_format(&wfx32) }, EndpointSampleFormat::Pcm32Container24);
+
+        // 24-bit packed PCM
+        let wfx24 = WAVEFORMATEX {
+            wFormatTag: 1,
+            nChannels: 2,
+            nSamplesPerSec: 48000,
+            nAvgBytesPerSec: 48000 * 2 * 3,
+            nBlockAlign: 6,
+            wBitsPerSample: 24,
+            cbSize: 0,
+        };
+        assert_eq!(unsafe { detect_sample_format(&wfx24) }, EndpointSampleFormat::Pcm24Packed);
+
+        // 16-bit PCM
+        let wfx16 = WAVEFORMATEX {
+            wFormatTag: 1,
+            nChannels: 2,
+            nSamplesPerSec: 48000,
+            nAvgBytesPerSec: 48000 * 2 * 2,
+            nBlockAlign: 4,
+            wBitsPerSample: 16,
+            cbSize: 0,
+        };
+        assert_eq!(unsafe { detect_sample_format(&wfx16) }, EndpointSampleFormat::Pcm16);
+    }
+
+    #[test]
+    fn test_write_frames_to_wasapi_all_formats() {
+        let input = vec![0.5f32, -0.5f32, 1.2f32, -1.2f32]; // 2 frames stereo with clipping test
+        let frames = 2;
+        let channels = 2;
+
+        // 1. Float32
+        let mut dst_float = vec![0.0f32; frames * channels];
+        unsafe {
+            write_frames_to_wasapi(
+                dst_float.as_mut_ptr() as *mut u8,
+                &input,
+                channels,
+                EndpointSampleFormat::Float32,
+                1.0,
+            );
+        }
+        assert!((dst_float[0] - 0.5).abs() < 1e-6);
+        assert!((dst_float[1] - (-0.5)).abs() < 1e-6);
+        assert_eq!(dst_float[2], 1.0); // clamped
+        assert_eq!(dst_float[3], -1.0); // clamped
+
+        // 2. Pcm32Container24
+        let mut dst_pcm32 = vec![0i32; frames * channels];
+        unsafe {
+            write_frames_to_wasapi(
+                dst_pcm32.as_mut_ptr() as *mut u8,
+                &input,
+                channels,
+                EndpointSampleFormat::Pcm32Container24,
+                1.0,
+            );
+        }
+        let expected_0 = ((0.5 * 2147483647.0) as i32) & !0xFF;
+        assert_eq!(dst_pcm32[0], expected_0);
+        assert_eq!(dst_pcm32[0] & 0xFF, 0); // 8 LSB bits zeroed for 24-in-32 alignment
+        assert_eq!(dst_pcm32[2], 2147483647 & !0xFF); // clamped to +1.0
+
+        // 3. Pcm24Packed (3 bytes per sample)
+        let mut dst_pcm24 = vec![0u8; frames * channels * 3];
+        unsafe {
+            write_frames_to_wasapi(
+                dst_pcm24.as_mut_ptr(),
+                &input,
+                channels,
+                EndpointSampleFormat::Pcm24Packed,
+                1.0,
+            );
+        }
+        let b0 = dst_pcm24[0];
+        let b1 = dst_pcm24[1];
+        let b2 = dst_pcm24[2];
+        let sample24 = ((b2 as i8 as i32) << 16) | ((b1 as i32) << 8) | (b0 as i32);
+        assert!((sample24 - 4194304).abs() <= 1);
+
+        // 4. Pcm16
+        let mut dst_pcm16 = vec![0i16; frames * channels];
+        unsafe {
+            write_frames_to_wasapi(
+                dst_pcm16.as_mut_ptr() as *mut u8,
+                &input,
+                channels,
+                EndpointSampleFormat::Pcm16,
+                1.0,
+            );
+        }
+        assert_eq!(dst_pcm16[0], 16384); // 0.5 * 32767.0 rounded
+        assert_eq!(dst_pcm16[2], 32767); // clamped 1.2 -> 1.0 -> 32767
+        assert_eq!(dst_pcm16[3], -32767); // clamped -1.2 -> -1.0 -> -32767
+    }
 }

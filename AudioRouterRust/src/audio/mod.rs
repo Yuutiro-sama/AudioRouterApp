@@ -38,7 +38,10 @@ pub use policy_config::{
     DEVINTERFACE_AUDIO_CAPTURE_SUFFIX, DEVINTERFACE_AUDIO_RENDER_SUFFIX,
     DEVINTERFACE_PATH_PREFIX, IID_AUDIO_POLICY_CONFIG_21H2, IID_AUDIO_POLICY_CONFIG_LEGACY,
 };
-pub use render::{spawn_render_worker, RenderTargetState};
+pub use render::{
+    detect_sample_format, spawn_render_worker, write_frames_to_wasapi, EndpointSampleFormat,
+    RenderTargetState,
+};
 pub use ring_buffer::SpscRingBuffer;
 
 use std::collections::HashMap;

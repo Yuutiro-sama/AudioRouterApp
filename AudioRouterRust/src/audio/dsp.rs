@@ -4,10 +4,13 @@
 //! - 4-Point Cubic Hermite fractional interpolator for high-fidelity resampling.
 //! - Boundary Clamping preventing micro-pops and boundary index dropouts.
 //! - Smooth Exponential Slew-to-Zero on buffer starvation.
-//! - 1st-order Exponential Moving Average (EMA) smoothed clock drift controller.
-//! - Overrun recovery with smooth crossfade / slew.
+//! - 3-Zone Continuous Rate Controller:
+//!   * Zone 1 (Normal, fill_ratio <= 1.8): Precise PI controller (Kp=0.0008, Ki=0.000008) with 1st-order EMA filter.
+//!   * Zone 2 (Soft Proportional Drain, 1.8 < fill_ratio <= 10.0): Smoothstep (3x^2 - 2x^3) progressive drain (+0.4% to +4.5%) with Zero Sample Loss.
+//!   * Zone 3 (Emergency Safety Valve, fill_ratio > 12.0): Slew-protected overrun recovery retaining 2x target fill frames.
+//! - Time-Scaled Cosine Slew (10ms): Hann-window based smooth crossfade scaled to output sample rate.
+//! - Soft Limiter & Headroom Guard (0.982 scaling + tanh knee) guarding against Hermite inter-sample peak overshoots.
 //! - One-pole exponential volume smoothing (Zero-Zipper Noise).
-//! - Soft limiter / clipper guarding against digital overs.
 //! - Multi-channel speaker matrixing (Mono, Stereo, 5.1, 7.1).
 
 use crate::audio::ring_buffer::SpscRingBuffer;
@@ -29,6 +32,7 @@ pub struct AdaptiveResamplerDsp {
     slew_total: usize,
     slew_from_l: f32,
     slew_from_r: f32,
+    default_slew_frames: usize,
     had_underrun: bool,
 }
 
@@ -43,6 +47,8 @@ impl AdaptiveResamplerDsp {
         let safe_out_rate = if out_rate == 0 { 48000 } else { out_rate };
         let target_fill_frames =
             ((safe_in_rate as usize) * (target_latency_ms as usize)) / 1000;
+        // Time-scaled 10ms default slew frames: 480 @ 48kHz, 3,840 @ 384kHz
+        let default_slew_frames = ((safe_out_rate as usize) / 100).max(256);
 
         Self {
             phase: 0.0,
@@ -57,9 +63,10 @@ impl AdaptiveResamplerDsp {
             last_sample_l: 0.0,
             last_sample_r: 0.0,
             slew_counter: 0,
-            slew_total: 0,
+            slew_total: default_slew_frames,
             slew_from_l: 0.0,
             slew_from_r: 0.0,
+            default_slew_frames,
             had_underrun: false,
         }
     }
@@ -82,6 +89,12 @@ impl AdaptiveResamplerDsp {
         self.target_fill_frames
     }
 
+    /// Default 10ms slew length in output frames.
+    #[inline(always)]
+    pub fn default_slew_frames(&self) -> usize {
+        self.default_slew_frames
+    }
+
     /// Reset DSP internal state (phase, integrator, gain, slew).
     pub fn reset(&mut self) {
         self.phase = 0.0;
@@ -91,7 +104,7 @@ impl AdaptiveResamplerDsp {
         self.last_sample_l = 0.0;
         self.last_sample_r = 0.0;
         self.slew_counter = 0;
-        self.slew_total = 0;
+        self.slew_total = self.default_slew_frames;
         self.slew_from_l = 0.0;
         self.slew_from_r = 0.0;
         self.had_underrun = false;
@@ -135,6 +148,24 @@ impl AdaptiveResamplerDsp {
         ((c3 * t + c2) * t + c1) * t + c0
     }
 
+    /// Soft limiter and headroom guard.
+    ///
+    /// Multiplies by 0.982 headroom factor (-0.158 dBFS) and applies smooth tanh
+    /// soft-limiting when the sample exceeds +/- 0.95. This completely guards
+    /// against cubic Hermite inter-sample peak overshoots (ISPs) that cause
+    /// integer wrap-around or harsh clipping on 24-bit fixed-point DAC endpoints.
+    #[inline(always)]
+    pub fn soft_limit(x: f32) -> f32 {
+        let scaled = x * 0.982;
+        if scaled > 0.95 {
+            0.95 + 0.05 * ((scaled - 0.95) / 0.05).tanh()
+        } else if scaled < -0.95 {
+            -0.95 - 0.05 * ((-scaled - 0.95) / 0.05).tanh()
+        } else {
+            scaled
+        }
+    }
+
     /// Processes an output block of stereo interleaved audio.
     ///
     /// * `rb`: Reference to the SpscRingBuffer supplying source stereo PCM.
@@ -171,18 +202,19 @@ impl AdaptiveResamplerDsp {
         let avail_samples = rb.available_read();
         let mut avail_frames = avail_samples / 2;
 
-        // Overrun recovery: if ring buffer has grown past 4x target fill frames,
-        // snap back to target to bound maximum latency, but smoothly slew from
-        // the last rendered sample to avoid an audible cliff/pop.
-        if avail_frames > self.target_fill_frames * 4 {
+        // Zone 3: Emergency safety valve (extreme latency backlog > 12x target, e.g. system sleep/resume)
+        let emergency_threshold = self.target_fill_frames * 12;
+        if avail_frames > emergency_threshold {
             self.slew_from_l = self.last_sample_l;
             self.slew_from_r = self.last_sample_r;
-            self.slew_total = 128.min(self.target_fill_frames);
+            self.slew_total = self.default_slew_frames;
             self.slew_counter = self.slew_total;
 
-            rb.reset_to_target_frames(self.target_fill_frames);
+            // Retain 2x target_fill_frames to prevent immediate starvation after emergency reset
+            let safe_retain = self.target_fill_frames * 2;
+            rb.reset_to_target_frames(safe_retain);
             self.integral_error = 0.0;
-            avail_frames = self.target_fill_frames;
+            avail_frames = safe_retain;
         }
 
         // Underrun protection: if the buffer is completely empty,
@@ -221,30 +253,40 @@ impl AdaptiveResamplerDsp {
             return;
         }
 
-        // If recovering from a previous starvation/underrun, slew smoothly into the incoming stream
+        // If recovering from a previous starvation/underrun, slew smoothly into incoming audio using Time-Scaled Cosine Slew
         if self.had_underrun {
             self.had_underrun = false;
             self.slew_from_l = self.last_sample_l;
             self.slew_from_r = self.last_sample_r;
-            self.slew_total = 64.min(avail_frames);
+            self.slew_total = self.default_slew_frames;
             self.slew_counter = self.slew_total;
         }
 
-        // PI Clock Drift Controller:
-        // Adjusts resampler step ratio to match the crystal oscillator of the output device.
-        let error = (avail_frames as f64 - self.target_fill_frames as f64)
-            / (self.target_fill_frames as f64);
-        self.integral_error = (self.integral_error + error).clamp(-150.0, 150.0);
+        // 3-Zone Continuous Rate Controller (PI + Soft Proportional Drain)
+        let target = self.target_fill_frames as f64;
+        let current = avail_frames as f64;
+        let fill_ratio = current / target;
 
-        let kp = 0.0008;
-        let ki = 0.000008;
-        // Dynamic drift range: allow faster drain if buffer is bloated (> 2x target)
-        let max_drift = if avail_frames > self.target_fill_frames * 2 { 1.02 } else { 1.008 };
-        let min_drift = if avail_frames < self.target_fill_frames / 2 { 0.98 } else { 0.992 };
-        let raw_drift_adjust = (1.0 + kp * error + ki * self.integral_error).clamp(min_drift, max_drift);
+        let target_adj = if fill_ratio > 1.8 {
+            // Zone 2: Soft Proportional Drain (1.8 < fill_ratio <= 10.0, up to 12.0)
+            // Gently increases reading speed from +0.4% up to +4.5% using Smoothstep (3x^2 - 2x^3).
+            // Drains accumulated buffer bursts smoothly over 1-2 seconds with ZERO sample loss.
+            let excess_norm = ((fill_ratio - 1.8) / 8.2).clamp(0.0, 1.0);
+            let smooth_curve = excess_norm * excess_norm * (3.0 - 2.0 * excess_norm);
+            self.integral_error = 0.0; // Reset/freeze PI integral to avoid windup while draining burst
+            1.004 + smooth_curve * 0.041
+        } else {
+            // Zone 1: Normal (fill_ratio <= 1.8)
+            // Precise PI controller (Kp = 0.0008, Ki = 0.000008), drift bounds [0.992, 1.008]
+            let error = (current - target) / target;
+            let kp = 0.0008;
+            let ki = 0.000008;
+            self.integral_error = (self.integral_error + error).clamp(-150.0, 150.0);
+            (1.0 + kp * error + ki * self.integral_error).clamp(0.992, 1.008)
+        };
 
         // 1st-order Exponential Moving Average (EMA) filter on drift adjust (0.98 / 0.02)
-        self.smoothed_drift = 0.98 * self.smoothed_drift + 0.02 * raw_drift_adjust;
+        self.smoothed_drift = 0.98 * self.smoothed_drift + 0.02 * target_adj;
         self.last_drift_ppm = ((self.smoothed_drift - 1.0) * 1_000_000.0) as i32;
 
         let step = self.base_ratio * self.smoothed_drift;
@@ -275,19 +317,28 @@ impl AdaptiveResamplerDsp {
                 let sample_l = Self::cubic_hermite(l0, l1, l2, l3, t);
                 let sample_r = Self::cubic_hermite(r0, r1, r2, r3, t);
 
-                // Soft-limiting / clipping guard
-                let raw_out_l = (sample_l * self.current_gain).clamp(-1.0, 1.0);
-                let raw_out_r = (sample_r * self.current_gain).clamp(-1.0, 1.0);
+                let gained_l = sample_l * self.current_gain;
+                let gained_r = sample_r * self.current_gain;
 
-                if self.slew_counter > 0 && self.slew_total > 0 {
-                    let blend = 1.0 - (self.slew_counter as f32 / self.slew_total as f32);
-                    let slewed_l = (1.0 - blend) * self.slew_from_l + blend * raw_out_l;
-                    let slewed_r = (1.0 - blend) * self.slew_from_r + blend * raw_out_r;
+                // Time-Scaled Cosine Crossfade Slew (10ms):
+                // alpha = 0.5 * (1.0 - cos(progress * PI))
+                let (slewed_l, slewed_r) = if self.slew_counter > 0 && self.slew_total > 0 {
+                    let progress = 1.0 - (self.slew_counter as f32 / self.slew_total as f32);
+                    let alpha = 0.5 * (1.0 - (progress * std::f32::consts::PI).cos());
+                    let l = (1.0 - alpha) * self.slew_from_l + alpha * gained_l;
+                    let r = (1.0 - alpha) * self.slew_from_r + alpha * gained_r;
                     self.slew_counter -= 1;
-                    (slewed_l, slewed_r)
+                    (l, r)
                 } else {
-                    (raw_out_l, raw_out_r)
-                }
+                    (gained_l, gained_r)
+                };
+
+                // Soft Limiting / Headroom Guard:
+                // Prevents cubic Hermite inter-sample peak overshoot from overflowing 24-bit DAC / integer wrap-around.
+                let out_l = Self::soft_limit(slewed_l);
+                let out_r = Self::soft_limit(slewed_r);
+
+                (out_l, out_r)
             } else {
                 // Buffer depleted during block processing:
                 // Smooth exponential slew-to-zero (decay factor 0.999) from last valid sample
@@ -454,26 +505,79 @@ mod tests {
 
     #[test]
     fn test_resampler_overrun_slew_continuity() {
-        let rb = SpscRingBuffer::new(8192);
+        let rb = SpscRingBuffer::new(32768);
         let mut dsp = AdaptiveResamplerDsp::new(48000, 48000, 15);
         let target = dsp.target_fill_frames();
 
-        // Push massive excess frames (> 4x target)
-        let excess_frames = target * 5;
+        // Push extreme excess frames (> 12x target, e.g. 14x) to trigger Zone 3 Emergency Safety Valve
+        let excess_frames = target * 14;
         let excess_data = vec![0.5f32; excess_frames * 2];
         rb.push_slice(&excess_data);
 
         let mut output = vec![0.0f32; 512];
         dsp.process_output_block(&rb, &mut output, 1.0, false);
 
-        // Buffer should have reset to target_fill_frames (minus frames consumed)
-        assert!(rb.available_read() / 2 <= target);
+        // Emergency recovery resets to safe_retain = 2x target_fill_frames (minus frames consumed)
+        assert!(rb.available_read() / 2 <= target * 2);
 
         // Verify no NaN or sudden spikes
         for &s in &output {
             assert!(!s.is_nan());
             assert!(s.abs() <= 1.0);
         }
+    }
+
+    #[test]
+    fn test_resampler_soft_proportional_drain_zone2() {
+        let rb = SpscRingBuffer::new(16384);
+        let mut dsp = AdaptiveResamplerDsp::new(48000, 48000, 15);
+        let target = dsp.target_fill_frames();
+
+        // Push excess frames in Zone 2 (4x target, fill_ratio = 4.0)
+        let excess_frames = target * 4;
+        let excess_data = vec![0.5f32; excess_frames * 2];
+        rb.push_slice(&excess_data);
+
+        let initial_avail = rb.available_read() / 2;
+        let mut output = vec![0.0f32; 512]; // 256 frames
+        dsp.process_output_block(&rb, &mut output, 1.0, false);
+
+        let remaining_avail = rb.available_read() / 2;
+        let consumed = initial_avail - remaining_avail;
+
+        // Zero Sample Loss: buffer was NOT hard reset! Only legitimately rendered frames consumed
+        assert!(consumed <= 300, "Should only consume rendered frames, not discard buffer: consumed={}", consumed);
+        assert!(remaining_avail > target * 2, "Buffer should not be reset to target in Zone 2");
+
+        // Drift should actively accelerate (positive drift, smoothed_drift > 1.0)
+        assert!(dsp.smoothed_drift() > 1.0, "Drift multiplier should accelerate to drain burst");
+        assert!(dsp.last_drift_ppm() > 0, "Drift ppm should be positive");
+    }
+
+    #[test]
+    fn test_soft_limiting_headroom_guard() {
+        // Zero signal
+        assert_eq!(AdaptiveResamplerDsp::soft_limit(0.0), 0.0);
+
+        // Linear region (< 0.95 scaled)
+        let val_05 = AdaptiveResamplerDsp::soft_limit(0.5);
+        assert!((val_05 - 0.5 * 0.982).abs() < 1e-6);
+
+        // Near 1.0 (Hermite normal peak): soft limited and strictly bounded < 1.0
+        let val_10 = AdaptiveResamplerDsp::soft_limit(1.0);
+        assert!(val_10 > 0.95);
+        assert!(val_10 < 1.0);
+
+        // Severe inter-sample overshoot (1.5): strictly bounded within [-1.0, 1.0]
+        let val_15 = AdaptiveResamplerDsp::soft_limit(1.5);
+        assert!(val_15 <= 1.0);
+        assert!(val_15 > 0.95);
+
+        // Symmetric negative
+        let val_neg_15 = AdaptiveResamplerDsp::soft_limit(-1.5);
+        assert!(val_neg_15 >= -1.0);
+        assert!(val_neg_15 < -0.95);
+        assert!((val_15 + val_neg_15).abs() < 1e-6);
     }
 
     #[test]

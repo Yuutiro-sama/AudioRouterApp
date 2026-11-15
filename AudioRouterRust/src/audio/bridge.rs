@@ -15,7 +15,9 @@ use windows::Win32::System::Com::*;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::audio::dsp::AdaptiveResamplerDsp;
-use crate::audio::render::{set_mmcss_pro_audio, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT};
+use crate::audio::render::{
+    detect_sample_format, set_mmcss_pro_audio, write_frames_to_wasapi, EndpointSampleFormat,
+};
 use crate::audio::ring_buffer::SpscRingBuffer;
 
 /// Active bridge connecting a source output device to a secondary target device.
@@ -47,7 +49,7 @@ impl DualOutputBridge {
                 "Source and target devices cannot be the same",
             ));
         }
-        let ring_buffer = Arc::new(SpscRingBuffer::default());
+        let ring_buffer = Arc::new(SpscRingBuffer::new(524288));
         let stop_signal = Arc::new(AtomicBool::new(false));
         let volume_scalar_bits = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let muted = Arc::new(AtomicBool::new(false));
@@ -188,13 +190,12 @@ fn capture_worker_loop(
         (activate_endpoint_audio_client(source_id)?, false)
     };
 
-    let (sample_rate, channels, bits_per_sample, is_float, init_res) = if is_process_loopback {
+    let (sample_rate, channels, sample_format, init_res) = if is_process_loopback {
         // VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK does not implement GetMixFormat().
         // Standard 48kHz 32-bit float stereo is the universally supported format for process loopback.
         let sample_rate = 48000u32;
         let channels = 2usize;
-        let bits_per_sample = 32u16;
-        let is_float = true;
+        let sample_format = EndpointSampleFormat::Float32;
 
         let wfx_ext = crate::audio::capture::create_waveformat_float_stereo(sample_rate);
         let pwfx = &wfx_ext as *const _ as *const windows::Win32::Media::Audio::WAVEFORMATEX;
@@ -209,24 +210,12 @@ fn capture_worker_loop(
                 None,
             )
         };
-        (sample_rate, channels, bits_per_sample, is_float, res)
+        (sample_rate, channels, sample_format, res)
     } else {
         let pwfx = unsafe { audio_client.GetMixFormat()? };
         let sample_rate = unsafe { (*pwfx).nSamplesPerSec };
         let channels = unsafe { (*pwfx).nChannels as usize };
-        let bits_per_sample = unsafe { (*pwfx).wBitsPerSample };
-
-        let is_float = unsafe {
-            if (*pwfx).wFormatTag == 3 {
-                true
-            } else if (*pwfx).wFormatTag == 0xFFFE {
-                let ext = pwfx as *const WAVEFORMATEXTENSIBLE;
-                let subformat = std::ptr::addr_of!((*ext).SubFormat).read_unaligned();
-                subformat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-            } else {
-                false
-            }
-        };
+        let sample_format = unsafe { detect_sample_format(pwfx) };
 
         let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
         let res = unsafe {
@@ -240,7 +229,7 @@ fn capture_worker_loop(
             )
         };
         unsafe { CoTaskMemFree(Some(pwfx as *const _ as *const _)) };
-        (sample_rate, channels, bits_per_sample, is_float, res)
+        (sample_rate, channels, sample_format, res)
     };
 
     source_rate.store(sample_rate, Ordering::Release);
@@ -331,47 +320,98 @@ fn capture_worker_loop(
                 for sample in &mut stereo_staging[..total_stereo_samples] {
                     *sample = 0.0;
                 }
-            } else if is_float && bits_per_sample == 32 {
-                let src_slice = unsafe {
-                    std::slice::from_raw_parts(
-                        buffer_ptr as *const f32,
-                        (num_frames_read as usize) * channels,
-                    )
-                };
-                for frame in 0..(num_frames_read as usize) {
-                    let base_src = frame * channels;
-                    let (l, r) = match channels {
-                        1 => (src_slice[base_src], src_slice[base_src]),
-                        _ => (src_slice[base_src], src_slice[base_src + 1]),
-                    };
-                    stereo_staging[frame * 2] = l;
-                    stereo_staging[frame * 2 + 1] = r;
-                }
-            } else if bits_per_sample == 16 {
-                let src_slice = unsafe {
-                    std::slice::from_raw_parts(
-                        buffer_ptr as *const i16,
-                        (num_frames_read as usize) * channels,
-                    )
-                };
-                for frame in 0..(num_frames_read as usize) {
-                    let base_src = frame * channels;
-                    let (l, r) = match channels {
-                        1 => (
-                            src_slice[base_src] as f32 / 32768.0,
-                            src_slice[base_src] as f32 / 32768.0,
-                        ),
-                        _ => (
-                            src_slice[base_src] as f32 / 32768.0,
-                            src_slice[base_src + 1] as f32 / 32768.0,
-                        ),
-                    };
-                    stereo_staging[frame * 2] = l;
-                    stereo_staging[frame * 2 + 1] = r;
-                }
             } else {
-                for sample in &mut stereo_staging[..total_stereo_samples] {
-                    *sample = 0.0;
+                match sample_format {
+                    EndpointSampleFormat::Float32 => {
+                        let src_slice = unsafe {
+                            std::slice::from_raw_parts(
+                                buffer_ptr as *const f32,
+                                (num_frames_read as usize) * channels,
+                            )
+                        };
+                        for frame in 0..(num_frames_read as usize) {
+                            let base_src = frame * channels;
+                            let (l, r) = match channels {
+                                1 => (src_slice[base_src], src_slice[base_src]),
+                                _ => (src_slice[base_src], src_slice[base_src + 1]),
+                            };
+                            stereo_staging[frame * 2] = l;
+                            stereo_staging[frame * 2 + 1] = r;
+                        }
+                    }
+                    EndpointSampleFormat::Pcm32Container24 => {
+                        let src_slice = unsafe {
+                            std::slice::from_raw_parts(
+                                buffer_ptr as *const i32,
+                                (num_frames_read as usize) * channels,
+                            )
+                        };
+                        for frame in 0..(num_frames_read as usize) {
+                            let base_src = frame * channels;
+                            let (l, r) = match channels {
+                                1 => (
+                                    src_slice[base_src] as f32 / 2147483648.0,
+                                    src_slice[base_src] as f32 / 2147483648.0,
+                                ),
+                                _ => (
+                                    src_slice[base_src] as f32 / 2147483648.0,
+                                    src_slice[base_src + 1] as f32 / 2147483648.0,
+                                ),
+                            };
+                            stereo_staging[frame * 2] = l;
+                            stereo_staging[frame * 2 + 1] = r;
+                        }
+                    }
+                    EndpointSampleFormat::Pcm24Packed => {
+                        let src_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                buffer_ptr,
+                                (num_frames_read as usize) * channels * 3,
+                            )
+                        };
+                        for frame in 0..(num_frames_read as usize) {
+                            let base_src = frame * channels * 3;
+                            let get_sample = |ch_offset: usize| -> f32 {
+                                let b0 = src_bytes[ch_offset] as i32;
+                                let b1 = src_bytes[ch_offset + 1] as i32;
+                                let b2 = src_bytes[ch_offset + 2] as i8 as i32;
+                                let val = (b2 << 16) | (b1 << 8) | b0;
+                                val as f32 / 8388608.0
+                            };
+                            let (l, r) = match channels {
+                                1 => {
+                                    let s = get_sample(base_src);
+                                    (s, s)
+                                }
+                                _ => (get_sample(base_src), get_sample(base_src + 3)),
+                            };
+                            stereo_staging[frame * 2] = l;
+                            stereo_staging[frame * 2 + 1] = r;
+                        }
+                    }
+                    EndpointSampleFormat::Pcm16 => {
+                        let src_slice = unsafe {
+                            std::slice::from_raw_parts(
+                                buffer_ptr as *const i16,
+                                (num_frames_read as usize) * channels,
+                            )
+                        };
+                        for frame in 0..(num_frames_read as usize) {
+                            let base_src = frame * channels;
+                            let (l, r) = match channels {
+                                1 => (
+                                    src_slice[base_src] as f32 / 32768.0,
+                                    src_slice[base_src] as f32 / 32768.0,
+                                ),
+                                _ => (
+                                    src_slice[base_src] as f32 / 32768.0,
+                                    src_slice[base_src + 1] as f32 / 32768.0,
+                                ),
+                            };
+                            stereo_staging[frame * 2] = l;
+                            stereo_staging[frame * 2 + 1] = r;
+                        }
+                    }
                 }
             }
 
@@ -419,34 +459,18 @@ fn render_worker_loop(
     let pwfx = unsafe { audio_client.GetMixFormat()? };
     let sample_rate = unsafe { (*pwfx).nSamplesPerSec };
     let channels = unsafe { (*pwfx).nChannels as usize };
-    let bits_per_sample = unsafe { (*pwfx).wBitsPerSample };
-
-    let is_float = unsafe {
-        if (*pwfx).wFormatTag == 3 {
-            true
-        } else if (*pwfx).wFormatTag == 0xFFFE {
-            let ext = pwfx as *const WAVEFORMATEXTENSIBLE;
-            let subformat = std::ptr::addr_of!((*ext).SubFormat).read_unaligned();
-            subformat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-        } else {
-            false
-        }
-    };
+    let sample_format = unsafe { detect_sample_format(pwfx) };
 
     let mut default_period: i64 = 0;
-    unsafe {
-        let _ = audio_client.GetDevicePeriod(Some(&mut default_period), None);
-    }
+    let mut min_period: i64 = 0;
+    let _ = unsafe { audio_client.GetDevicePeriod(Some(&mut default_period), Some(&mut min_period)) };
     let base_period = if default_period > 0 {
         default_period
     } else {
         100_000 // 10ms
     };
-    let buffer_duration = if sample_rate >= 192000 {
-        (base_period * 3).max(350_000) // ~35ms-40ms hardware triple-buffer for ultra high-res
-    } else {
-        (base_period * 2).max(200_000)
-    };
+    // WASAPI Quadruple-Buffering: (base_period * 4).max(400_000) (minimum 40ms) for ALL devices
+    let buffer_duration = (base_period * 4).max(400_000);
 
     unsafe {
         audio_client.Initialize(
@@ -480,7 +504,8 @@ fn render_worker_loop(
         in_rate = 48000;
     }
 
-    let target_latency_ms = if sample_rate >= 192000 { 40 } else { 20 };
+    // Unified target_latency_ms = 40ms for ALL audio devices
+    let target_latency_ms: u32 = 40;
     let mut dsp = AdaptiveResamplerDsp::new(in_rate, sample_rate, target_latency_ms);
 
     // Pre-Roll Buffer Priming:
@@ -505,7 +530,7 @@ fn render_worker_loop(
     // Prime the buffer with silence to start stream smoothly
     unsafe {
         let initial_buf = render_client.GetBuffer(buffer_frame_count)?;
-        let bytes_per_sample = (bits_per_sample as usize) / 8;
+        let bytes_per_sample = sample_format.bytes_per_sample();
         std::ptr::write_bytes(initial_buf, 0, (buffer_frame_count as usize) * channels * bytes_per_sample);
         render_client.ReleaseBuffer(buffer_frame_count, 0)?;
         audio_client.Start()?;
@@ -565,25 +590,14 @@ fn render_worker_loop(
             muted,
         );
 
-        if is_float && bits_per_sample == 32 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    intermediate_f32.as_ptr() as *const u8,
-                    dest_ptr,
-                    total_samples * std::mem::size_of::<f32>(),
-                );
-            }
-        } else if bits_per_sample == 16 {
-            let dest_slice =
-                unsafe { std::slice::from_raw_parts_mut(dest_ptr as *mut i16, total_samples) };
-            for (i, &s) in intermediate_f32[..total_samples].iter().enumerate() {
-                dest_slice[i] = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-            }
-        } else {
-            let bytes_per_sample = (bits_per_sample as usize) / 8;
-            unsafe {
-                std::ptr::write_bytes(dest_ptr, 0, total_samples * bytes_per_sample);
-            }
+        unsafe {
+            write_frames_to_wasapi(
+                dest_ptr,
+                &intermediate_f32[..total_samples],
+                channels,
+                sample_format,
+                1.0,
+            );
         }
 
         let _ = unsafe { render_client.ReleaseBuffer(frames_needed, 0) };
@@ -599,6 +613,7 @@ fn render_worker_loop(
 mod tests {
     use super::*;
     use crate::audio::enumerator::enumerate_render_devices;
+    use crate::audio::render::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 
     #[test]
     fn test_print_all_device_formats() {
@@ -615,20 +630,21 @@ mod tests {
                             let rate = unsafe { (*pwfx).nSamplesPerSec };
                             let ch = unsafe { (*pwfx).nChannels };
                             let bits = unsafe { (*pwfx).wBitsPerSample };
-                            let is_float = unsafe {
+                            let (is_float, valid_bits, subformat_guid) = unsafe {
                                 if tag == 3 {
-                                    true
+                                    (true, bits, windows::core::GUID::zeroed())
                                 } else if tag == 0xFFFE {
                                     let ext = pwfx as *const WAVEFORMATEXTENSIBLE;
                                     let subformat = std::ptr::addr_of!((*ext).SubFormat).read_unaligned();
-                                    subformat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+                                    let valid = std::ptr::addr_of!((*ext).Samples.wValidBitsPerSample).read_unaligned();
+                                    (subformat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, valid, subformat)
                                 } else {
-                                    false
+                                    (false, bits, windows::core::GUID::zeroed())
                                 }
                             };
                             println!(
-                                "Device: [{}] -> Tag: 0x{:X}, Rate: {} Hz, Ch: {}, Bits: {}, Float: {}",
-                                d.name, tag, rate, ch, bits, is_float
+                                "Device: [{}] -> Tag: 0x{:X}, Rate: {} Hz, Ch: {}, Bits: {}, ValidBits: {}, Float: {}, SubFormat: {:?}",
+                                d.name, tag, rate, ch, bits, valid_bits, is_float, subformat_guid
                             );
                             unsafe { CoTaskMemFree(Some(pwfx as *const _ as *const _)) };
                         }
@@ -768,19 +784,30 @@ mod tests {
         if let (Some(r), Some(c), Some(s)) = (realtek, cx, sessions.first()) {
             println!("\n=== LIVE PROCESS-SPECIFIC DUAL BRIDGE TEST ===");
             println!("Target App: [{}] | PID: {}", s.name, s.pid);
-            println!("Bridge: PID {} -> [{}] -> [{}]", s.pid, r.name, c.name);
+            println!("Bridge 1: PID {} -> [{}] -> [{}] (CX31993 384k -> Realtek 48k)", s.pid, c.name, r.name);
 
-            let mut bridge = DualOutputBridge::start(s.pid, r.id.clone(), c.id.clone())
-                .expect("Failed to start process-specific bridge");
+            let mut bridge1 = DualOutputBridge::start(s.pid, c.id.clone(), r.id.clone())
+                .expect("Failed to start process-specific bridge 1");
 
-            std::thread::sleep(Duration::from_millis(1000));
+            for _ in 0..6 {
+                std::thread::sleep(Duration::from_millis(500));
+                let lat = f32::from_bits(bridge1.latency_ms.load(Ordering::Acquire));
+                let drift = bridge1.drift_ppm.load(Ordering::Acquire);
+                println!("Bridge CX31993->Realtek: latency = {:.2} ms, drift = {} ppm", lat, drift);
+            }
+            bridge1.stop();
 
-            let lat = f32::from_bits(bridge.latency_ms.load(Ordering::Acquire));
-            let drift = bridge.drift_ppm.load(Ordering::Acquire);
-            println!("Process Bridge running smoothly: latency = {:.2} ms, drift = {} ppm", lat, drift);
+            println!("\nBridge 2: PID {} -> [{}] -> [{}] (Realtek 48k -> CX31993 384k)", s.pid, r.name, c.name);
+            let mut bridge2 = DualOutputBridge::start(s.pid, r.id.clone(), c.id.clone())
+                .expect("Failed to start process-specific bridge 2");
 
-            bridge.stop();
-            println!("Process Bridge stopped cleanly without leaks!");
+            for _ in 0..6 {
+                std::thread::sleep(Duration::from_millis(500));
+                let lat = f32::from_bits(bridge2.latency_ms.load(Ordering::Acquire));
+                let drift = bridge2.drift_ppm.load(Ordering::Acquire);
+                println!("Bridge Realtek->CX31993: latency = {:.2} ms, drift = {} ppm", lat, drift);
+            }
+            bridge2.stop();
             println!("==============================================\n");
         }
         unsafe { CoUninitialize() };

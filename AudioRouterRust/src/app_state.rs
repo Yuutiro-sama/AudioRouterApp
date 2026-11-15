@@ -105,11 +105,17 @@ impl AppState {
         let default_dev = get_default_render_device().ok().flatten();
         let default_id = default_dev.as_ref().map(|d| d.id.as_str()).unwrap_or_default();
 
+        let current_pid = std::process::id();
         let sessions = get_active_app_sessions(&self.devices);
         let mut active_routes: Vec<(u32, String, String)> = Vec::new();
         let mut seen_routes: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
 
         for session in &sessions {
+            // Skip system sounds (PID 0) and self (AudioRouter)
+            if session.pid == 0 || session.pid == current_pid {
+                continue;
+            }
+
             let rule = config.get_app_rule(&session.name);
             if rule.secondary_enabled && !rule.secondary_device.is_empty() {
                 let primary = if !rule.primary_device.is_empty() && rule.primary_device != "multi" {
@@ -130,17 +136,11 @@ impl AppState {
                 let secondary = rule.secondary_device.trim().to_string();
 
                 if !secondary.is_empty() && secondary != primary && secondary != "multi" {
-                    let mut target_pids = vec![session.pid];
-                    for sibling_pid in get_pids_by_process_name(&session.name) {
-                        if !target_pids.contains(&sibling_pid) {
-                            target_pids.push(sibling_pid);
-                        }
-                    }
-
-                    for pid in target_pids {
-                        if seen_routes.insert((pid, secondary.clone())) {
-                            active_routes.push((pid, primary.clone(), secondary.clone()));
-                        }
+                    // Only route the exact session PID that actually owns the audio stream.
+                    // Do NOT scan sibling PIDs: multi-process apps (Brave, Chrome) have 10-20 PIDs,
+                    // and spawning bridges on all of them causes WASAPI DMA conflicts on the secondary device.
+                    if seen_routes.insert((session.pid, secondary.clone())) {
+                        active_routes.push((session.pid, primary, secondary));
                     }
                 }
             }
@@ -500,5 +500,77 @@ mod tests {
         // dev_headphones is now disabled to save CPU and audio resources
         assert!(!engine.get_target_by_id("dev_headphones").unwrap().is_enabled());
         assert!(!engine.has_active_secondary());
+    }
+
+    #[test]
+    fn test_sync_multi_engine_route_collection_no_sibling_explosion() {
+        let current_pid = std::process::id();
+
+        // Simulate active audio sessions for Brave (PID 1234), duplicate session for Brave (PID 1234),
+        // system sounds (PID 0), and AudioRouter itself (current_pid)
+        struct MockSession {
+            pid: u32,
+            name: String,
+            device_id: String,
+        }
+
+        let mock_sessions = vec![
+            MockSession {
+                pid: 0,
+                name: "System Sounds".to_string(),
+                device_id: "dev_speakers".to_string(),
+            },
+            MockSession {
+                pid: current_pid,
+                name: "AudioRouterRust.exe".to_string(),
+                device_id: "dev_speakers".to_string(),
+            },
+            MockSession {
+                pid: 1234,
+                name: "brave.exe".to_string(),
+                device_id: "dev_speakers".to_string(),
+            },
+            // Duplicate session for same PID (e.g. 2 tabs or alert sound in same process)
+            MockSession {
+                pid: 1234,
+                name: "brave.exe".to_string(),
+                device_id: "dev_speakers".to_string(),
+            },
+        ];
+
+        let mut cfg = ConfigV3::new();
+        cfg.set_app_primary_device("brave.exe".into(), "dev_speakers".into());
+        cfg.set_app_secondary_device("brave.exe".into(), "dev_headphones".into());
+        cfg.set_app_secondary_enabled("brave.exe".into(), true);
+
+        let mut active_routes: Vec<(u32, String, String)> = Vec::new();
+        let mut seen_routes: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
+
+        for session in &mock_sessions {
+            // Skip system sounds (PID 0) and self (AudioRouter)
+            if session.pid == 0 || session.pid == current_pid {
+                continue;
+            }
+
+            let rule = cfg.get_app_rule(&session.name);
+            if rule.secondary_enabled && !rule.secondary_device.is_empty() {
+                let primary = if !rule.primary_device.is_empty() && rule.primary_device != "multi" {
+                    rule.primary_device.clone()
+                } else {
+                    session.device_id.clone()
+                };
+                let secondary = rule.secondary_device.trim().to_string();
+
+                if !secondary.is_empty() && secondary != primary && secondary != "multi" {
+                    if seen_routes.insert((session.pid, secondary.clone())) {
+                        active_routes.push((session.pid, primary, secondary));
+                    }
+                }
+            }
+        }
+
+        // Must ONLY contain exactly 1 route for PID 1234 (no duplicate, no PID 0, no self, no siblings)
+        assert_eq!(active_routes.len(), 1);
+        assert_eq!(active_routes[0], (1234, "dev_speakers".to_string(), "dev_headphones".to_string()));
     }
 }
