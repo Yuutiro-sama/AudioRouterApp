@@ -41,7 +41,7 @@ pub use policy_config::{
 };
 pub use render::{
     detect_sample_format, spawn_render_worker, write_frames_to_wasapi, EndpointSampleFormat,
-    RenderTargetState,
+    RenderTargetState, TpdfDitherState, XorShift32, PCM24_MAX, PCM24_MIN, PCM24_SCALE,
 };
 pub use ring_buffer::SpscRingBuffer;
 

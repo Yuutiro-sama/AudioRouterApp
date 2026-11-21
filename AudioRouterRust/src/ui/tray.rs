@@ -101,7 +101,7 @@ pub fn create_speaker_icon() -> Result<HICON, windows::core::Error> {
                     255u32
                 };
 
-                let r = (0 * alpha) / 255;
+                let r = 0u32;
                 let g = (120 * alpha) / 255;
                 let b = (215 * alpha) / 255;
                 pixels[y * WIDTH + x] = (alpha << 24) | (r << 16) | (g << 8) | b;

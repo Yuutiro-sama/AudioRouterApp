@@ -4,7 +4,7 @@
 //! and resamples & renders it into a designated target render endpoint (Secondary Device B)
 //! with sub-1ms internal latency, 4-point Cubic Hermite interpolation, and PI clock drift compensation.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use crate::audio::dsp::AdaptiveResamplerDsp;
 use crate::audio::render::{
     detect_sample_format, set_mmcss_pro_audio, write_frames_to_wasapi, EndpointSampleFormat,
+    TpdfDitherState,
 };
 use crate::audio::ring_buffer::SpscRingBuffer;
 
@@ -28,7 +29,10 @@ pub struct DualOutputBridge {
     pub volume_scalar_bits: Arc<AtomicU32>,
     pub muted: Arc<AtomicBool>,
     pub latency_ms: Arc<AtomicU32>,
+    pub initial_latency_ms: Arc<AtomicU32>,
     pub drift_ppm: Arc<AtomicI32>,
+    pub underrun_count: Arc<AtomicU64>,
+    pub slew_trigger_count: Arc<AtomicU64>,
     stop_signal: Arc<AtomicBool>,
     capture_handle: Option<std::thread::JoinHandle<()>>,
     render_handle: Option<std::thread::JoinHandle<()>>,
@@ -54,7 +58,10 @@ impl DualOutputBridge {
         let volume_scalar_bits = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let muted = Arc::new(AtomicBool::new(false));
         let latency_ms = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+        let initial_latency_ms = Arc::new(AtomicU32::new(0.0f32.to_bits()));
         let drift_ppm = Arc::new(AtomicI32::new(0));
+        let underrun_count = Arc::new(AtomicU64::new(0));
+        let slew_trigger_count = Arc::new(AtomicU64::new(0));
 
         let source_rate = Arc::new(AtomicU32::new(0));
 
@@ -95,7 +102,10 @@ impl DualOutputBridge {
         let vol_bits = volume_scalar_bits.clone();
         let mute_flag = muted.clone();
         let lat_atomic = latency_ms.clone();
+        let init_lat_atomic = initial_latency_ms.clone();
         let drift_atomic = drift_ppm.clone();
+        let underrun_atomic = underrun_count.clone();
+        let slew_atomic = slew_trigger_count.clone();
         let src_rate_ren = source_rate.clone();
 
         let render_handle = std::thread::Builder::new()
@@ -111,7 +121,10 @@ impl DualOutputBridge {
                     &vol_bits,
                     &mute_flag,
                     &lat_atomic,
+                    &init_lat_atomic,
                     &drift_atomic,
+                    &underrun_atomic,
+                    &slew_atomic,
                     &stop_ren,
                 );
                 if let Err(e) = res {
@@ -132,11 +145,29 @@ impl DualOutputBridge {
             volume_scalar_bits,
             muted,
             latency_ms,
+            initial_latency_ms,
             drift_ppm,
+            underrun_count,
+            slew_trigger_count,
             stop_signal,
             capture_handle: Some(capture_handle),
             render_handle: Some(render_handle),
         })
+    }
+
+    /// Returns initial buffer latency in milliseconds measured right after initialization.
+    pub fn get_initial_latency_ms(&self) -> f32 {
+        f32::from_bits(self.initial_latency_ms.load(Ordering::Acquire))
+    }
+
+    /// Returns total buffer underrun count.
+    pub fn get_underrun_count(&self) -> u64 {
+        self.underrun_count.load(Ordering::Acquire)
+    }
+
+    /// Returns total slew / emergency crossfade events count.
+    pub fn get_slew_trigger_count(&self) -> u64 {
+        self.slew_trigger_count.load(Ordering::Acquire)
     }
 
     /// Sets the volume scalar [0.0 .. 1.0] for this bridge.
@@ -441,6 +472,7 @@ fn activate_endpoint_audio_client(source_id: &str) -> windows::core::Result<IAud
     unsafe { device.Activate(CLSCTX_ALL, None) }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_worker_loop(
     target_id: &str,
     rb: &Arc<SpscRingBuffer>,
@@ -448,7 +480,10 @@ fn render_worker_loop(
     volume_bits: &Arc<AtomicU32>,
     muted_flag: &Arc<AtomicBool>,
     lat_atomic: &Arc<AtomicU32>,
+    init_lat_atomic: &Arc<AtomicU32>,
     drift_atomic: &Arc<AtomicI32>,
+    underrun_atomic: &Arc<AtomicU64>,
+    slew_atomic: &Arc<AtomicU64>,
     stop_signal: &Arc<AtomicBool>,
 ) -> windows::core::Result<()> {
     let enumerator: IMMDeviceEnumerator =
@@ -509,10 +544,10 @@ fn render_worker_loop(
     let mut dsp = AdaptiveResamplerDsp::new(in_rate, sample_rate, target_latency_ms);
 
     // Pre-Roll Buffer Priming:
-    // Ensure capture thread primes the ring buffer with at least `dsp.target_fill_frames()`
-    // (with a max timeout of 300ms to prevent hanging if the source is silent/idle).
-    // This guarantees that high-rate render streams (especially 384kHz) start with
-    // a generous cushion of frames, preventing initial buffer starvation/underrun glitches.
+    // 1. Drain residual/stale audio in ring buffer before priming
+    rb.clear();
+
+    // 2. Wait until capture primes ring buffer with at least min_prime_frames (40ms)
     let prime_start = std::time::Instant::now();
     let min_prime_frames = dsp.target_fill_frames();
     while (rb.available_read() / 2) < min_prime_frames
@@ -527,16 +562,48 @@ fn render_worker_loop(
         return Ok(());
     }
 
-    // Prime the buffer with silence to start stream smoothly
+    // 3. Single-Budget Latency Initialization (Target 40ms):
+    // Pre-fill only 1 render period (~10ms) directly from Ring Buffer through DSP,
+    // avoiding the 40ms silence pre-load that previously pushed initial latency to ~120ms.
+    let period_frames = (((base_period as u64) * (sample_rate as u64) + 5_000_000) / 10_000_000) as u32;
+    let initial_frames = period_frames.min(buffer_frame_count).max(1);
+
+    let mut intermediate_f32: Vec<f32> = Vec::with_capacity((buffer_frame_count as usize) * channels);
+    let mut dither_state = TpdfDitherState::new();
+
+    let initial_total_samples = (initial_frames as usize) * channels;
+    if intermediate_f32.len() < initial_total_samples {
+        intermediate_f32.resize(initial_total_samples, 0.0f32);
+    }
+
+    let target_vol = f32::from_bits(volume_bits.load(Ordering::Acquire));
+    let muted = muted_flag.load(Ordering::Acquire);
+
+    dsp.process_output_block_multichannel(
+        rb,
+        &mut intermediate_f32[..initial_total_samples],
+        channels,
+        target_vol,
+        muted,
+    );
+
     unsafe {
-        let initial_buf = render_client.GetBuffer(buffer_frame_count)?;
-        let bytes_per_sample = sample_format.bytes_per_sample();
-        std::ptr::write_bytes(initial_buf, 0, (buffer_frame_count as usize) * channels * bytes_per_sample);
-        render_client.ReleaseBuffer(buffer_frame_count, 0)?;
+        let initial_buf = render_client.GetBuffer(initial_frames)?;
+        write_frames_to_wasapi(
+            initial_buf,
+            &intermediate_f32[..initial_total_samples],
+            channels,
+            sample_format,
+            1.0,
+            &mut dither_state,
+        );
+        render_client.ReleaseBuffer(initial_frames, 0)?;
         audio_client.Start()?;
     }
 
-    let mut intermediate_f32: Vec<f32> = Vec::with_capacity((buffer_frame_count as usize) * channels);
+    let init_avail = rb.available_read() / 2;
+    let init_lat = dsp.current_latency_ms(init_avail);
+    init_lat_atomic.store(init_lat.to_bits(), Ordering::Release);
 
     while !stop_signal.load(Ordering::Relaxed) {
         let wait_res = unsafe { WaitForSingleObject(event, 500) };
@@ -566,11 +633,13 @@ fn render_worker_loop(
         let target_vol = f32::from_bits(volume_bits.load(Ordering::Acquire));
         let muted = muted_flag.load(Ordering::Acquire);
 
-        // Update real-time stats
+        // Update real-time stats & telemetry
         let avail_frames = rb.available_read() / 2;
         let latency = dsp.current_latency_ms(avail_frames);
         lat_atomic.store(latency.to_bits(), Ordering::Release);
         drift_atomic.store(dsp.last_drift_ppm(), Ordering::Release);
+        underrun_atomic.store(dsp.underrun_count(), Ordering::Release);
+        slew_atomic.store(dsp.slew_trigger_count(), Ordering::Release);
 
         let dest_ptr = match unsafe { render_client.GetBuffer(frames_needed) } {
             Ok(ptr) => ptr,
@@ -597,6 +666,7 @@ fn render_worker_loop(
                 channels,
                 sample_format,
                 1.0,
+                &mut dither_state,
             );
         }
 
@@ -789,11 +859,28 @@ mod tests {
             let mut bridge1 = DualOutputBridge::start(s.pid, c.id.clone(), r.id.clone())
                 .expect("Failed to start process-specific bridge 1");
 
-            for _ in 0..6 {
+            for i in 0..6 {
                 std::thread::sleep(Duration::from_millis(500));
                 let lat = f32::from_bits(bridge1.latency_ms.load(Ordering::Acquire));
                 let drift = bridge1.drift_ppm.load(Ordering::Acquire);
-                println!("Bridge CX31993->Realtek: latency = {:.2} ms, drift = {} ppm", lat, drift);
+                let underruns = bridge1.underrun_count.load(Ordering::Acquire);
+                let slews = bridge1.slew_trigger_count.load(Ordering::Acquire);
+                println!(
+                    "Bridge CX31993->Realtek [sample {}]: latency = {:.2} ms, drift = {} ppm, underruns = {}, slews = {}",
+                    i, lat, drift, underruns, slews
+                );
+                // Assert initial latency is stable around 40ms (<= 55ms, down radically from 119ms)
+                assert!(
+                    lat <= 55.0,
+                    "Bridge 1 latency exceeded 55ms target (expected ~40ms single-budget): got {:.2} ms",
+                    lat
+                );
+                // Assert drift is strictly bounded within ±1500 ppm (Zone 2 maximum)
+                assert!(
+                    drift.abs() <= 1500,
+                    "Bridge 1 drift exceeded ±1500 ppm bound: got {} ppm",
+                    drift
+                );
             }
             bridge1.stop();
 
@@ -801,11 +888,26 @@ mod tests {
             let mut bridge2 = DualOutputBridge::start(s.pid, r.id.clone(), c.id.clone())
                 .expect("Failed to start process-specific bridge 2");
 
-            for _ in 0..6 {
+            for i in 0..6 {
                 std::thread::sleep(Duration::from_millis(500));
                 let lat = f32::from_bits(bridge2.latency_ms.load(Ordering::Acquire));
                 let drift = bridge2.drift_ppm.load(Ordering::Acquire);
-                println!("Bridge Realtek->CX31993: latency = {:.2} ms, drift = {} ppm", lat, drift);
+                let underruns = bridge2.underrun_count.load(Ordering::Acquire);
+                let slews = bridge2.slew_trigger_count.load(Ordering::Acquire);
+                println!(
+                    "Bridge Realtek->CX31993 [sample {}]: latency = {:.2} ms, drift = {} ppm, underruns = {}, slews = {}",
+                    i, lat, drift, underruns, slews
+                );
+                assert!(
+                    lat <= 55.0,
+                    "Bridge 2 latency exceeded 55ms target (expected ~40ms single-budget): got {:.2} ms",
+                    lat
+                );
+                assert!(
+                    drift.abs() <= 1500,
+                    "Bridge 2 drift exceeded ±1500 ppm bound: got {} ppm",
+                    drift
+                );
             }
             bridge2.stop();
             println!("==============================================\n");
