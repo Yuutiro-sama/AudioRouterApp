@@ -517,8 +517,8 @@ fn render_worker_loop(
     } else {
         100_000 // 10ms
     };
-    // WASAPI Quadruple-Buffering: (base_period * 4).max(400_000) (minimum 40ms) for ALL devices
-    let buffer_duration = (base_period * 4).max(400_000);
+    // WASAPI Quintuple-Buffering: (base_period * 5).max(500_000) (minimum 50ms) for ALL devices to absorb DPC spikes
+    let buffer_duration = (base_period * 5).max(500_000);
 
     unsafe {
         audio_client.Initialize(
@@ -552,8 +552,8 @@ fn render_worker_loop(
         in_rate = 48000;
     }
 
-    // Unified target_latency_ms = 40ms for ALL audio devices
-    let target_latency_ms: u32 = 40;
+    // Unified target_latency_ms = 45ms for ALL audio devices (solid cushion against 5-6ms DPC latency spikes)
+    let target_latency_ms: u32 = 45;
     let mut dsp = AdaptiveResamplerDsp::new(in_rate, sample_rate, target_latency_ms);
 
     // Pre-Roll Buffer Priming:
