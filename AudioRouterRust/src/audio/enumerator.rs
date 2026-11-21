@@ -86,6 +86,7 @@ impl From<AppAudioSession> for crate::ui::popup::AppAudioItem {
             volume: s.volume,
             is_muted: s.is_muted,
             current_device_id: cur,
+            sibling_pids: s.sibling_pids,
         }
     }
 }
@@ -216,22 +217,38 @@ impl CandidateSession {
     }
 }
 
-/// Checks if a session belongs to the AudioRouter application itself or matches current process ID.
-pub fn is_self_process(pid: u32, name: &str, exe_path: Option<&str>, current_pid: u32) -> bool {
-    if pid == current_pid {
-        return true;
-    }
+/// Checks if a process name or executable path belongs to an excluded process:
+/// - AudioRouter itself (`audiorouter`, `audio_router`)
+/// - Recording & streaming tools (`literec`, `literec.app`, `ffmpeg`)
+pub fn is_excluded_process(name: &str, exe_path: Option<&str>) -> bool {
     let lower_name = name.trim().to_lowercase();
-    if lower_name.contains("audiorouter") || lower_name.contains("audio_router") {
+    if lower_name.contains("audiorouter")
+        || lower_name.contains("audio_router")
+        || lower_name.contains("literec")
+        || lower_name.contains("ffmpeg")
+    {
         return true;
     }
     if let Some(path) = exe_path {
         let lower_path = path.trim().to_lowercase();
-        if lower_path.contains("audiorouter") || lower_path.contains("audio_router") {
+        if lower_path.contains("audiorouter")
+            || lower_path.contains("audio_router")
+            || lower_path.contains("literec")
+            || lower_path.contains("ffmpeg")
+        {
             return true;
         }
     }
     false
+}
+
+/// Checks if a session belongs to the AudioRouter application itself, matches current process ID,
+/// or belongs to excluded recording processes (LiteRec, FFmpeg).
+pub fn is_self_process(pid: u32, name: &str, exe_path: Option<&str>, current_pid: u32) -> bool {
+    if pid == current_pid {
+        return true;
+    }
+    is_excluded_process(name, exe_path)
 }
 
 /// Normalizes executable name to a deduplication key (case-insensitive without .exe suffix).
@@ -509,6 +526,10 @@ pub fn get_active_app_sessions(devices: &[AudioDevice]) -> Vec<AppAudioSession> 
 
 /// Queries all process IDs matching a given process/executable name (case-insensitive).
 pub fn get_pids_by_process_name(name: &str) -> Vec<u32> {
+    if is_excluded_process(name, None) {
+        return Vec::new();
+    }
+
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
     };
@@ -688,6 +709,7 @@ mod tests {
         assert_eq!(ui_item.secondary_enabled, session.secondary_enabled);
         assert_eq!(ui_item.volume, session.volume);
         assert_eq!(ui_item.is_muted, session.is_muted);
+        assert_eq!(ui_item.sibling_pids, session.sibling_pids);
     }
 
     #[test]
@@ -762,6 +784,71 @@ mod tests {
         }
         assert!(result.iter().any(|s| s.name.to_lowercase() == "spotify.exe"));
         assert!(result.iter().any(|s| s.name.to_lowercase() == "firefox.exe"));
+    }
+
+    #[test]
+    fn test_filter_recording_processes() {
+        let current_pid = 9999;
+        assert!(is_excluded_process("literec.exe", None));
+        assert!(is_excluded_process("LiteRec.App.exe", None));
+        assert!(is_excluded_process("LITEREC.EXE", None));
+        assert!(is_excluded_process("ffmpeg.exe", None));
+        assert!(is_excluded_process("FFMPEG.EXE", None));
+        assert!(is_excluded_process("app.exe", Some("C:\\Tools\\LiteRec\\literec.exe")));
+        assert!(is_excluded_process("worker", Some("D:\\bin\\ffmpeg.exe")));
+        assert!(is_excluded_process("AudioRouter.exe", None));
+
+        assert!(!is_excluded_process("spotify.exe", None));
+        assert!(!is_excluded_process("brave.exe", None));
+        assert!(!is_excluded_process("chrome.exe", None));
+        assert!(!is_excluded_process("discord.exe", None));
+
+        assert!(get_pids_by_process_name("literec").is_empty());
+        assert!(get_pids_by_process_name("ffmpeg.exe").is_empty());
+
+        let candidates = vec![
+            CandidateSession {
+                pid: 101,
+                name: "LiteRec.App.exe".to_string(),
+                exe_path: Some("C:\\LiteRec\\LiteRec.App.exe".to_string()),
+                volume: 1.0,
+                muted: false,
+                device_id: "dev1".to_string(),
+                is_active: true,
+            },
+            CandidateSession {
+                pid: 102,
+                name: "literec.exe".to_string(),
+                exe_path: None,
+                volume: 1.0,
+                muted: false,
+                device_id: "dev1".to_string(),
+                is_active: false,
+            },
+            CandidateSession {
+                pid: 103,
+                name: "ffmpeg.exe".to_string(),
+                exe_path: Some("C:\\ffmpeg\\bin\\ffmpeg.exe".to_string()),
+                volume: 1.0,
+                muted: false,
+                device_id: "dev1".to_string(),
+                is_active: true,
+            },
+            CandidateSession {
+                pid: 201,
+                name: "spotify.exe".to_string(),
+                exe_path: Some("C:\\Spotify\\spotify.exe".to_string()),
+                volume: 0.8,
+                muted: false,
+                device_id: "dev1".to_string(),
+                is_active: true,
+            },
+        ];
+
+        let result = deduplicate_sessions(candidates, current_pid);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "spotify.exe");
+        assert_eq!(result[0].pid, 201);
     }
 
     #[test]

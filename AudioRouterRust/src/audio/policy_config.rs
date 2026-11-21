@@ -4,6 +4,8 @@
 //! `Windows.Media.Internal.AudioPolicyConfig`.
 
 use core::ffi::c_void;
+use std::sync::mpsc::{channel, Sender};
+use std::thread;
 use windows::core::{GUID, HRESULT, HSTRING, IInspectable, IInspectable_Vtbl, Interface};
 use windows::Win32::Media::Audio::{
     eConsole, eMultimedia, eRender, EDataFlow, ERole,
@@ -195,6 +197,100 @@ pub fn clear_all_persisted_application_default_endpoints(
     }
 }
 
+/// Request payload sent to the MTA worker thread for asynchronous routing.
+#[derive(Debug, Clone)]
+pub struct PolicyRouteRequest {
+    pub pids: Vec<u32>,
+    pub endpoint_path: Option<String>,
+}
+
+/// Asynchronous, non-blocking COM policy router running on a dedicated MTA worker thread.
+///
+/// Prevents COM RPC blocking on the Win32 UI thread and message pump, and serializes
+/// routing commands to audiosrv without redundant RPC invocations.
+#[derive(Clone)]
+pub struct AsyncPolicyRouter {
+    sender: Sender<PolicyRouteRequest>,
+}
+
+impl AsyncPolicyRouter {
+    pub fn new() -> Self {
+        let (sender, receiver) = channel::<PolicyRouteRequest>();
+
+        let _ = thread::Builder::new()
+            .name("AudioPolicyRouterWorker".to_string())
+            .spawn(move || {
+                unsafe {
+                    let _ = windows::Win32::System::Com::CoInitializeEx(
+                        None,
+                        windows::Win32::System::Com::COINIT_MULTITHREADED,
+                    );
+                }
+
+                let mut factory_opt = get_policy_config_factory().ok();
+
+                while let Ok(req) = receiver.recv() {
+                    if factory_opt.is_none() {
+                        factory_opt = get_policy_config_factory().ok();
+                    }
+
+                    if let Some(ref mut factory) = factory_opt {
+                        for pid in req.pids {
+                            let mut success = false;
+                            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                set_app_output_device(
+                                    factory,
+                                    pid,
+                                    eRender,
+                                    req.endpoint_path.as_deref(),
+                                )
+                            }));
+                            if let Ok(Ok(())) = res {
+                                success = true;
+                            }
+                            if !success {
+                                if let Ok(new_factory) = get_policy_config_factory() {
+                                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        let _ = set_app_output_device(
+                                            &new_factory,
+                                            pid,
+                                            eRender,
+                                            req.endpoint_path.as_deref(),
+                                        );
+                                    }));
+                                    *factory = new_factory;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                unsafe {
+                    windows::Win32::System::Com::CoUninitialize();
+                }
+            });
+
+        Self { sender }
+    }
+
+    /// Asynchronously applies output routing for the given list of process IDs.
+    /// Returns immediately without blocking the caller thread.
+    pub fn route(&self, pids: Vec<u32>, short_device_id: Option<String>) {
+        if !pids.is_empty() {
+            let _ = self.sender.send(PolicyRouteRequest {
+                pids,
+                endpoint_path: short_device_id,
+            });
+        }
+    }
+}
+
+impl Default for AsyncPolicyRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +330,13 @@ mod tests {
         }
         let factory = get_policy_config_factory();
         assert!(factory.is_ok(), "Failed to get AudioPolicyConfig activation factory: {:?}", factory.err());
+    }
+
+    #[test]
+    fn test_async_policy_router_lifecycle() {
+        let router = AsyncPolicyRouter::new();
+        router.route(vec![999999], None);
+        router.route(vec![999998], Some("{0.0.0.00000000}.{dummy}".to_string()));
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }

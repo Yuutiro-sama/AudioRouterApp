@@ -6,20 +6,17 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Media::Audio::{
-    eRender, IMMDeviceEnumerator, IMMNotificationClient, MMDeviceEnumerator,
+    IMMDeviceEnumerator, IMMNotificationClient, MMDeviceEnumerator,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
 use crate::audio::enumerator::{
-    enumerate_render_devices, get_active_app_sessions, get_default_render_device,
-    get_pids_by_process_name, AudioDevice,
+    enumerate_render_devices, get_active_app_sessions, get_default_render_device, AudioDevice,
 };
 use crate::audio::notification::{
     register_device_hotplug, unregister_device_hotplug, DeviceHotplugClient,
 };
-use crate::audio::policy_config::{
-    get_policy_config_factory, set_app_output_device, IAudioPolicyConfigFactory,
-};
+use crate::audio::policy_config::{get_policy_config_factory, IAudioPolicyConfigFactory};
 use crate::audio::MultiOutputEngine;
 use crate::config::rules::{load_config_v3, load_rules, save_rules};
 use crate::ui::popup::{AppAudioItem, DeviceItem};
@@ -28,6 +25,8 @@ use crate::ui::popup::{AppAudioItem, DeviceItem};
 pub struct AppState {
     /// Undocumented WinRT COM factory for per-app routing
     pub factory: IAudioPolicyConfigFactory,
+    /// Dedicated MTA background worker for non-blocking COM policy routing
+    pub async_router: crate::audio::AsyncPolicyRouter,
     /// Keep-alive enumerator reference to preserve hardware notification callbacks
     pub enumerator: IMMDeviceEnumerator,
     /// Keep-alive notification client receiving hotplug events
@@ -49,6 +48,7 @@ impl AppState {
     pub fn new(notify_hwnd: HWND) -> windows::core::Result<Self> {
         // 1. Activate AudioPolicyConfig WinRT factory
         let factory = get_policy_config_factory()?;
+        let async_router = crate::audio::AsyncPolicyRouter::new();
 
         // 2. Instantiate IMMDeviceEnumerator for audio endpoint enumeration and notifications
         let enumerator: IMMDeviceEnumerator = unsafe {
@@ -72,6 +72,7 @@ impl AppState {
 
         let state = Self {
             factory,
+            async_router,
             enumerator,
             hotplug_client,
             rules,
@@ -111,8 +112,16 @@ impl AppState {
         let mut seen_routes: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
 
         for session in &sessions {
-            // Skip system sounds (PID 0) and self (AudioRouter)
-            if session.pid == 0 || session.pid == current_pid {
+            // Skip system sounds (PID 0) and self (AudioRouter) or excluded recording tools
+            if session.pid == 0
+                || session.pid == current_pid
+                || crate::audio::enumerator::is_self_process(
+                    session.pid,
+                    &session.name,
+                    session.exe_path.as_deref(),
+                    current_pid,
+                )
+            {
                 continue;
             }
 
@@ -267,6 +276,16 @@ impl AppState {
 
         // 2. For each active app session: route primary endpoint and apply volume/mute
         for session in &sessions {
+            // Safety check: Never apply routing to self or recording processes (LiteRec, FFmpeg)
+            if crate::audio::enumerator::is_self_process(
+                session.pid,
+                &session.name,
+                session.exe_path.as_deref(),
+                std::process::id(),
+            ) {
+                continue;
+            }
+
             let app_rule = config.get_app_rule(&session.name);
             let target_rule = if !app_rule.primary_device.is_empty() {
                 Some(app_rule.primary_device.clone())
@@ -275,37 +294,21 @@ impl AppState {
             };
 
             if let Some(rule) = target_rule {
-                if rule == "multi" || rule.is_empty() {
-                    // Reset to default device (None) so master loopback captures it for multi-output
-                    let _ = set_app_output_device(&self.factory, session.pid, eRender, None);
-                    let sibling_pids = get_pids_by_process_name(&session.name);
-                    for pid in sibling_pids {
-                        if pid != session.pid {
-                            let _ = set_app_output_device(&self.factory, pid, eRender, None);
+                let endpoint_param = if rule == "multi" || rule.is_empty() {
+                    None
+                } else {
+                    Some(rule.clone())
+                };
+
+                if force || session.current_device_id != rule {
+                    let mut target_pids = vec![session.pid];
+                    for &s_pid in &session.sibling_pids {
+                        if !target_pids.contains(&s_pid) {
+                            target_pids.push(s_pid);
                         }
                     }
+                    self.async_router.route(target_pids, endpoint_param);
                     count += 1;
-                } else if force || session.current_device_id != rule {
-                    let res = set_app_output_device(
-                        &self.factory,
-                        session.pid,
-                        eRender,
-                        Some(&rule),
-                    );
-                    if res.is_ok() {
-                        count += 1;
-                    }
-                    let sibling_pids = get_pids_by_process_name(&session.name);
-                    for pid in sibling_pids {
-                        if pid != session.pid {
-                            let _ = set_app_output_device(
-                                &self.factory,
-                                pid,
-                                eRender,
-                                Some(&rule),
-                            );
-                        }
-                    }
                 }
             }
 
@@ -323,7 +326,17 @@ impl AppState {
         let sessions = get_active_app_sessions(&self.devices);
 
         for session in sessions {
-            if session.pid == pid {
+            if session.pid == pid || session.sibling_pids.contains(&pid) {
+                // Safety check: Never route self or recording tools (LiteRec, FFmpeg)
+                if crate::audio::enumerator::is_self_process(
+                    session.pid,
+                    &session.name,
+                    session.exe_path.as_deref(),
+                    std::process::id(),
+                ) {
+                    return false;
+                }
+
                 let app_rule = config.get_app_rule(&session.name);
                 let target_rule = if !app_rule.primary_device.is_empty() {
                     Some(app_rule.primary_device)
@@ -335,31 +348,22 @@ impl AppState {
                     let endpoint_param = if rule == "multi" || rule.is_empty() {
                         None
                     } else {
-                        Some(rule.as_str())
+                        Some(rule)
                     };
 
-                    let res = set_app_output_device(
-                        &self.factory,
-                        session.pid,
-                        eRender,
-                        endpoint_param,
-                    );
-                    let sibling_pids = get_pids_by_process_name(&session.name);
-                    for s_pid in sibling_pids {
-                        if s_pid != session.pid {
-                            let _ = set_app_output_device(
-                                &self.factory,
-                                s_pid,
-                                eRender,
-                                endpoint_param,
-                            );
+                    let mut target_pids = vec![session.pid];
+                    for s_pid in session.sibling_pids {
+                        if !target_pids.contains(&s_pid) {
+                            target_pids.push(s_pid);
                         }
                     }
+
+                    self.async_router.route(target_pids, endpoint_param);
 
                     let _ = crate::audio::set_app_volume(session.pid, &session.current_device_id, app_rule.volume);
                     let _ = crate::audio::set_app_mute(session.pid, &session.current_device_id, app_rule.muted);
 
-                    return res.is_ok();
+                    return true;
                 }
                 break;
             }
@@ -396,7 +400,13 @@ impl AppState {
         let sessions = get_active_app_sessions(&self.devices);
         for session in sessions {
             if session.name.to_lowercase() == app_lower {
-                let _ = set_app_output_device(&self.factory, session.pid, eRender, None);
+                let mut target_pids = vec![session.pid];
+                for &s_pid in &session.sibling_pids {
+                    if !target_pids.contains(&s_pid) {
+                        target_pids.push(s_pid);
+                    }
+                }
+                self.async_router.route(target_pids, None);
             }
         }
         self.apply_all_rules(true);

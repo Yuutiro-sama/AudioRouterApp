@@ -34,9 +34,10 @@ pub use notification::{
 pub use policy_config::{
     clear_all_persisted_application_default_endpoints, format_endpoint_interface_path,
     get_app_output_device, get_policy_config_factory, normalize_device_id_to_endpoint,
-    set_app_output_device, IAudioPolicyConfigFactory, IAudioPolicyConfigFactory_Vtbl,
-    DEVINTERFACE_AUDIO_CAPTURE_SUFFIX, DEVINTERFACE_AUDIO_RENDER_SUFFIX,
-    DEVINTERFACE_PATH_PREFIX, IID_AUDIO_POLICY_CONFIG_21H2, IID_AUDIO_POLICY_CONFIG_LEGACY,
+    set_app_output_device, AsyncPolicyRouter, IAudioPolicyConfigFactory,
+    IAudioPolicyConfigFactory_Vtbl, PolicyRouteRequest, DEVINTERFACE_AUDIO_CAPTURE_SUFFIX,
+    DEVINTERFACE_AUDIO_RENDER_SUFFIX, DEVINTERFACE_PATH_PREFIX, IID_AUDIO_POLICY_CONFIG_21H2,
+    IID_AUDIO_POLICY_CONFIG_LEGACY,
 };
 pub use render::{
     detect_sample_format, spawn_render_worker, write_frames_to_wasapi, EndpointSampleFormat,

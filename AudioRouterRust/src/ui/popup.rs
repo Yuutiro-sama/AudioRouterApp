@@ -131,6 +131,7 @@ pub struct AppAudioItem {
     pub volume: f32, // 0.0 .. 1.0
     pub is_muted: bool,
     pub current_device_id: String,
+    pub sibling_pids: Vec<u32>,
 }
 
 impl AppAudioItem {
@@ -145,6 +146,7 @@ impl AppAudioItem {
             volume: 1.0,
             is_muted: false,
             current_device_id: String::new(),
+            sibling_pids: vec![pid],
         }
     }
 }
@@ -1489,52 +1491,12 @@ unsafe extern "system" fn flyout_wndproc(
                                 app.current_device_id.clear();
                                 config.set_app_primary_device(app.name.clone(), String::new());
                                 let _ = save_config_v3(&config);
-
-                                if let Ok(factory) = crate::audio::policy_config::get_policy_config_factory() {
-                                    let _ = crate::audio::policy_config::set_app_output_device(
-                                        &factory,
-                                        app.pid,
-                                        windows::Win32::Media::Audio::eRender,
-                                        None,
-                                    );
-                                    let sibling_pids = crate::audio::enumerator::get_pids_by_process_name(&app.name);
-                                    for pid in sibling_pids {
-                                        if pid != app.pid {
-                                            let _ = crate::audio::policy_config::set_app_output_device(
-                                                &factory,
-                                                pid,
-                                                windows::Win32::Media::Audio::eRender,
-                                                None,
-                                            );
-                                        }
-                                    }
-                                }
                             } else if sel - 1 < state.devices.len() {
                                 let dev = &state.devices[sel - 1];
                                 app.primary_device_id = dev.id.clone();
                                 app.current_device_id = dev.id.clone();
                                 config.set_app_primary_device(app.name.clone(), dev.id.clone());
                                 let _ = save_config_v3(&config);
-
-                                if let Ok(factory) = crate::audio::policy_config::get_policy_config_factory() {
-                                    let _ = crate::audio::policy_config::set_app_output_device(
-                                        &factory,
-                                        app.pid,
-                                        windows::Win32::Media::Audio::eRender,
-                                        Some(&dev.id),
-                                    );
-                                    let sibling_pids = crate::audio::enumerator::get_pids_by_process_name(&app.name);
-                                    for pid in sibling_pids {
-                                        if pid != app.pid {
-                                            let _ = crate::audio::policy_config::set_app_output_device(
-                                                &factory,
-                                                pid,
-                                                windows::Win32::Media::Audio::eRender,
-                                                Some(&dev.id),
-                                            );
-                                        }
-                                    }
-                                }
                             }
 
                             // Nếu thiết bị chính vừa chọn trùng với thiết bị phụ đang có, an toàn reset thiết bị phụ
