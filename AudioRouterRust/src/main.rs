@@ -26,7 +26,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassExW, SetTimer,
-    SetWindowLongPtrW, TranslateMessage, GWLP_USERDATA, MSG, WNDCLASSEXW,
+    SetWindowLongPtrW, TranslateMessage, CS_GLOBALCLASS, GWLP_USERDATA, MSG, WNDCLASSEXW,
     WS_EX_TOOLWINDOW, WS_POPUP,
     WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP,
     WM_RBUTTONUP, WM_TIMER,
@@ -81,8 +81,7 @@ unsafe extern "system" fn dispatcher_wndproc(
         data.app_state.refresh_devices();
         let device_items = data.app_state.get_device_items();
         let app_items = data.app_state.get_app_items();
-        let tray_rect = data.tray_icon.get_rect();
-        toggle_flyout(hwnd, device_items, app_items, tray_rect);
+        toggle_flyout(hwnd, device_items, app_items, None);
         return LRESULT(0);
     }
 
@@ -119,9 +118,8 @@ unsafe extern "system" fn dispatcher_wndproc(
                     data.app_state.refresh_devices();
                     let device_items = data.app_state.get_device_items();
                     let app_items = data.app_state.get_app_items();
-                    let tray_rect = data.tray_icon.get_rect();
-                    debug_log(&format!("Calling toggle_flyout with {} apps, {} devices", app_items.len(), device_items.len()));
-                    toggle_flyout(hwnd, device_items, app_items, tray_rect);
+                    debug_log(&format!("Calling toggle_flyout (standalone) with {} apps, {} devices", app_items.len(), device_items.len()));
+                    toggle_flyout(hwnd, device_items, app_items, None);
                     LRESULT(0)
                 }
                 IDM_APPLY_RULES => {
@@ -197,6 +195,10 @@ unsafe extern "system" fn dispatcher_wndproc(
 
         WM_DESTROY => {
             debug_log("dispatcher_wndproc: WM_DESTROY received, posting quit message");
+            if let Ok(dir) = std::env::var("APPDATA") {
+                let p = format!("{}\\AudioRouter\\dispatcher.hwnd", dir);
+                let _ = std::fs::remove_file(p);
+            }
             let _ = data.tray_icon.remove();
             let _ = Box::from_raw(data_ptr);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -227,41 +229,31 @@ fn main() -> windows::core::Result<()> {
     let mutex_name = w!("AudioRouterApp_SingleInstance");
     let mutex_handle = unsafe { CreateMutexW(None, true, mutex_name) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        debug_log("Instance already exists, waking existing UI and exiting");
-        unsafe {
-            use windows::Win32::UI::WindowsAndMessaging::*;
-            let broadcast_msg = RegisterWindowMessageW(w!("AudioRouter_ShowUI"));
-
-            let existing_hwnd = FindWindowW(
-                w!("AudioRouterDispatcherClass"),
-                w!("AudioRouterDispatcher"),
-            );
-            if let Ok(h) = existing_hwnd {
-                if !h.is_invalid() && !h.0.is_null() {
-                    let mut pid = 0u32;
-                    let _ = GetWindowThreadProcessId(h, Some(&mut pid));
-                    if pid > 0 {
-                        let _ = AllowSetForegroundWindow(pid);
-                    }
-                    if broadcast_msg != 0 {
-                        let _ = PostMessageW(h, broadcast_msg, WPARAM(0), LPARAM(0));
-                    }
-                    let _ = PostMessageW(
-                        h,
-                        WM_COMMAND,
-                        WPARAM(crate::ipc_messages::IDM_SHOW_UI as usize),
-                        LPARAM(0),
-                    );
+        let args: Vec<String> = std::env::args().collect();
+        let explicit_tray = args.iter().any(|a| {
+            a == "--tray"
+                || a == "--minimized"
+                || a == "-m"
+                || a == "--silent"
+                || a == "--background"
+                || a == "--startup"
+        });
+        if !explicit_tray {
+            debug_log("Instance already exists, granting foreground and signaling wake event");
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(0xFFFFFFFF);
+                if let Ok(ev) = windows::Win32::System::Threading::OpenEventW(
+                    windows::Win32::System::Threading::EVENT_MODIFY_STATE,
+                    false,
+                    w!("AudioRouterApp_WakeEvent_v3"),
+                ) {
+                    let _ = windows::Win32::System::Threading::SetEvent(ev);
+                    let _ = CloseHandle(ev);
+                    debug_log("Wake event successfully signaled!");
                 }
             }
-            if broadcast_msg != 0 {
-                let _ = PostMessageW(
-                    HWND_BROADCAST,
-                    broadcast_msg,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
-            }
+        } else {
+            debug_log("Instance already exists and started with --tray, exiting silently");
         }
         return Ok(());
     }
@@ -283,6 +275,7 @@ fn main() -> windows::core::Result<()> {
 
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        style: CS_GLOBALCLASS,
         lpfnWndProc: Some(dispatcher_wndproc),
         hInstance: instance.into(),
         lpszClassName: class_name,
@@ -314,6 +307,10 @@ fn main() -> windows::core::Result<()> {
     let hwnd = match hwnd {
         Ok(h) => {
             debug_log(&format!("Dispatcher window created, hwnd={:?}", h.0));
+            if let Ok(dir) = std::env::var("APPDATA") {
+                let p = format!("{}\\AudioRouter\\dispatcher.hwnd", dir);
+                let _ = std::fs::write(p, format!("{}", h.0 as usize));
+            }
             h
         }
         Err(e) => {
@@ -321,6 +318,53 @@ fn main() -> windows::core::Result<()> {
             return Err(e);
         }
     };
+
+    // 5b. Start Background Win32 Wake Listener using named Session Event
+    let wake_event = unsafe {
+        windows::Win32::System::Threading::CreateEventW(
+            None,
+            false,
+            false,
+            windows::core::w!("AudioRouterApp_WakeEvent_v3"),
+        )
+    };
+    if let Ok(event_handle) = wake_event {
+        let event_raw = event_handle.0 as isize;
+        let target_hwnd_val = hwnd.0 as usize;
+        std::thread::Builder::new()
+            .name("AudioRouter_WakeListener".into())
+            .spawn(move || {
+                let event_handle = windows::Win32::Foundation::HANDLE(event_raw as *mut core::ffi::c_void);
+                loop {
+                    let wait_res = unsafe {
+                        windows::Win32::System::Threading::WaitForSingleObject(
+                            event_handle,
+                            0xFFFFFFFF,
+                        )
+                    };
+                    if wait_res == windows::Win32::Foundation::WAIT_OBJECT_0 {
+                        crate::debug_log("AudioRouter_WakeListener: WakeEvent signaled!");
+                        let target_hwnd = windows::Win32::Foundation::HWND(target_hwnd_val as _);
+                        unsafe {
+                            let mut pid = 0u32;
+                            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(target_hwnd, Some(&mut pid));
+                            if pid > 0 {
+                                let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(pid);
+                            }
+                            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                                target_hwnd,
+                                windows::Win32::UI::WindowsAndMessaging::WM_COMMAND,
+                                windows::Win32::Foundation::WPARAM(crate::ipc_messages::IDM_SHOW_UI as usize),
+                                windows::Win32::Foundation::LPARAM(0),
+                            );
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            })
+            .ok();
+    }
 
     // 6. Initialize AppState, TrayIcon, and Taskbar message subscription
     debug_log("Initializing AppState");
@@ -382,11 +426,8 @@ fn main() -> windows::core::Result<()> {
     }
 
     // If started with --tray, -m, --minimized, --silent, --background, --startup,
-    // OR if Windows system uptime is < 5 minutes (system startup/logon),
     // stay silently in the system tray without popping up any window.
     let args: Vec<String> = std::env::args().collect();
-    let uptime_ms = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
-    let is_recent_boot = uptime_ms < 300_000;
     let explicit_tray = args.iter().any(|a| {
         a == "--tray"
             || a == "--minimized"
@@ -396,8 +437,7 @@ fn main() -> windows::core::Result<()> {
             || a == "--startup"
     });
 
-    let start_in_tray = explicit_tray || is_recent_boot;
-    if !start_in_tray {
+    if !explicit_tray {
         unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                 hwnd,

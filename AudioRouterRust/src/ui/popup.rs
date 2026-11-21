@@ -41,7 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     STM_SETICON, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE,
     WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM,
     WM_ERASEBKGND, WM_HSCROLL, WM_KEYDOWN, WM_MOUSEWHEEL, WM_PAINT, WM_SETFONT, WM_VSCROLL,
-    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 
@@ -174,6 +174,7 @@ struct ChildLayout {
 struct FlyoutState {
     created_at: std::time::Instant,
     has_focused: bool,
+    is_tray_flyout: bool,
     owner_hwnd: HWND,
     container_hwnd: HWND,
     scale: f32,
@@ -465,11 +466,21 @@ pub fn toggle_flyout(
         let h = HWND(prev as _);
         if unsafe { IsWindow(h) }.as_bool() {
             let is_visible = unsafe { IsWindowVisible(h) }.as_bool();
-            if is_visible && tray_rect.is_some() {
-                crate::debug_log("toggle_flyout: hiding window on tray toggle click");
-                let _ = unsafe { ShowWindow(h, SW_HIDE) };
-                trim_background_memory();
-                return;
+            if is_visible {
+                if tray_rect.is_some() {
+                    crate::debug_log("toggle_flyout: hiding window on tray toggle click");
+                    let _ = unsafe { ShowWindow(h, SW_HIDE) };
+                    trim_background_memory();
+                    return;
+                } else {
+                    crate::debug_log("toggle_flyout: bringing existing window to foreground");
+                    unsafe {
+                        let _ = ShowWindow(h, SW_SHOW);
+                        let _ = SetForegroundWindow(h);
+                        let _ = BringWindowToTop(h);
+                    }
+                    return;
+                }
             }
         }
         // Always recreate flyout to ensure freshly launched audio sessions are displayed
@@ -550,10 +561,16 @@ pub fn toggle_flyout(
         let dummy_height = 360;
         let (pos_x, pos_y) = calculate_flyout_position(dummy_width, dummy_height, tray_rect);
 
-                let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                let ex_style = if tray_rect.is_some() {
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST
+        } else {
+            WS_EX_APPWINDOW | WS_EX_TOPMOST
+        };
+
+        let hwnd = CreateWindowExW(
+            ex_style,
             class_name,
-            w!("Audio Router Flyout"),
+            w!("Audio Router"),
             WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
             pos_x,
             pos_y,
@@ -1163,6 +1180,7 @@ pub fn toggle_flyout(
         let state = Box::new(FlyoutState {
             created_at: std::time::Instant::now(),
             has_focused: false,
+            is_tray_flyout: tray_rect.is_some(),
             owner_hwnd,
             container_hwnd,
             scale,
@@ -1234,6 +1252,11 @@ unsafe extern "system" fn flyout_wndproc(
 
             if !state_ptr.is_null() {
                 let state = &*state_ptr;
+                // If launched as a standalone window (from Desktop/Start Menu), do not auto-dismiss on blur
+                if !state.is_tray_flyout {
+                    return LRESULT(0);
+                }
+
                 // Only dismiss if the window has been focused at least once,
                 // and at least 800ms has elapsed since creation to avoid race conditions.
                 if !state.has_focused || state.created_at.elapsed().as_millis() < 800 {
