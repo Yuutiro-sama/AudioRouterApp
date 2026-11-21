@@ -4,7 +4,7 @@
 //! and resamples & renders it into a designated target render endpoint (Secondary Device B)
 //! with sub-1ms internal latency, 4-point Cubic Hermite interpolation, and PI clock drift compensation.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-use crate::audio::dsp::AdaptiveResamplerDsp;
+use crate::audio::dsp::{AdaptiveResamplerDsp, ResamplerState};
 use crate::audio::render::{
     detect_sample_format, set_mmcss_pro_audio, write_frames_to_wasapi, EndpointSampleFormat,
     TpdfDitherState,
@@ -33,6 +33,7 @@ pub struct DualOutputBridge {
     pub drift_ppm: Arc<AtomicI32>,
     pub underrun_count: Arc<AtomicU64>,
     pub slew_trigger_count: Arc<AtomicU64>,
+    pub dsp_state: Arc<AtomicU8>,
     stop_signal: Arc<AtomicBool>,
     capture_handle: Option<std::thread::JoinHandle<()>>,
     render_handle: Option<std::thread::JoinHandle<()>>,
@@ -62,6 +63,7 @@ impl DualOutputBridge {
         let drift_ppm = Arc::new(AtomicI32::new(0));
         let underrun_count = Arc::new(AtomicU64::new(0));
         let slew_trigger_count = Arc::new(AtomicU64::new(0));
+        let dsp_state = Arc::new(AtomicU8::new(ResamplerState::Priming as u8));
 
         let source_rate = Arc::new(AtomicU32::new(0));
 
@@ -106,6 +108,7 @@ impl DualOutputBridge {
         let drift_atomic = drift_ppm.clone();
         let underrun_atomic = underrun_count.clone();
         let slew_atomic = slew_trigger_count.clone();
+        let state_atomic = dsp_state.clone();
         let src_rate_ren = source_rate.clone();
 
         let render_handle = std::thread::Builder::new()
@@ -125,6 +128,7 @@ impl DualOutputBridge {
                     &drift_atomic,
                     &underrun_atomic,
                     &slew_atomic,
+                    &state_atomic,
                     &stop_ren,
                 );
                 if let Err(e) = res {
@@ -149,6 +153,7 @@ impl DualOutputBridge {
             drift_ppm,
             underrun_count,
             slew_trigger_count,
+            dsp_state,
             stop_signal,
             capture_handle: Some(capture_handle),
             render_handle: Some(render_handle),
@@ -168,6 +173,11 @@ impl DualOutputBridge {
     /// Returns total slew / emergency crossfade events count.
     pub fn get_slew_trigger_count(&self) -> u64 {
         self.slew_trigger_count.load(Ordering::Acquire)
+    }
+
+    /// Returns the current FSM state of the adaptive resampler DSP engine.
+    pub fn get_dsp_state(&self) -> ResamplerState {
+        ResamplerState::from_u8(self.dsp_state.load(Ordering::Acquire))
     }
 
     /// Sets the volume scalar [0.0 .. 1.0] for this bridge.
@@ -342,106 +352,108 @@ fn capture_worker_loop(
             }
 
             let is_silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
+            if is_silent {
+                if num_frames_read > 0 {
+                    rb.push_silence(num_frames_read as usize);
+                }
+                let _ = unsafe { capture_client.ReleaseBuffer(num_frames_read) };
+                continue;
+            }
+
             let total_stereo_samples = (num_frames_read as usize) * 2;
             if stereo_staging.len() < total_stereo_samples {
                 stereo_staging.resize(total_stereo_samples, 0.0f32);
             }
 
-            if is_silent {
-                for sample in &mut stereo_staging[..total_stereo_samples] {
-                    *sample = 0.0;
+            match sample_format {
+                EndpointSampleFormat::Float32 => {
+                    let src_slice = unsafe {
+                        std::slice::from_raw_parts(
+                            buffer_ptr as *const f32,
+                            (num_frames_read as usize) * channels,
+                        )
+                    };
+                    for frame in 0..(num_frames_read as usize) {
+                        let base_src = frame * channels;
+                        let (l, r) = match channels {
+                            1 => (src_slice[base_src], src_slice[base_src]),
+                            _ => (src_slice[base_src], src_slice[base_src + 1]),
+                        };
+                        stereo_staging[frame * 2] = l;
+                        stereo_staging[frame * 2 + 1] = r;
+                    }
                 }
-            } else {
-                match sample_format {
-                    EndpointSampleFormat::Float32 => {
-                        let src_slice = unsafe {
-                            std::slice::from_raw_parts(
-                                buffer_ptr as *const f32,
-                                (num_frames_read as usize) * channels,
-                            )
+                EndpointSampleFormat::Pcm32Container24 => {
+                    let src_slice = unsafe {
+                        std::slice::from_raw_parts(
+                            buffer_ptr as *const i32,
+                            (num_frames_read as usize) * channels,
+                        )
+                    };
+                    for frame in 0..(num_frames_read as usize) {
+                        let base_src = frame * channels;
+                        let (l, r) = match channels {
+                            1 => (
+                                src_slice[base_src] as f32 / 2147483648.0,
+                                src_slice[base_src] as f32 / 2147483648.0,
+                            ),
+                            _ => (
+                                src_slice[base_src] as f32 / 2147483648.0,
+                                src_slice[base_src + 1] as f32 / 2147483648.0,
+                            ),
                         };
-                        for frame in 0..(num_frames_read as usize) {
-                            let base_src = frame * channels;
-                            let (l, r) = match channels {
-                                1 => (src_slice[base_src], src_slice[base_src]),
-                                _ => (src_slice[base_src], src_slice[base_src + 1]),
-                            };
-                            stereo_staging[frame * 2] = l;
-                            stereo_staging[frame * 2 + 1] = r;
-                        }
+                        stereo_staging[frame * 2] = l;
+                        stereo_staging[frame * 2 + 1] = r;
                     }
-                    EndpointSampleFormat::Pcm32Container24 => {
-                        let src_slice = unsafe {
-                            std::slice::from_raw_parts(
-                                buffer_ptr as *const i32,
-                                (num_frames_read as usize) * channels,
-                            )
+                }
+                EndpointSampleFormat::Pcm24Packed => {
+                    let src_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            buffer_ptr,
+                            (num_frames_read as usize) * channels * 3,
+                        )
+                    };
+                    for frame in 0..(num_frames_read as usize) {
+                        let base_src = frame * channels * 3;
+                        let get_sample = |ch_offset: usize| -> f32 {
+                            let b0 = src_bytes[ch_offset] as i32;
+                            let b1 = src_bytes[ch_offset + 1] as i32;
+                            let b2 = src_bytes[ch_offset + 2] as i8 as i32;
+                            let val = (b2 << 16) | (b1 << 8) | b0;
+                            val as f32 / 8388608.0
                         };
-                        for frame in 0..(num_frames_read as usize) {
-                            let base_src = frame * channels;
-                            let (l, r) = match channels {
-                                1 => (
-                                    src_slice[base_src] as f32 / 2147483648.0,
-                                    src_slice[base_src] as f32 / 2147483648.0,
-                                ),
-                                _ => (
-                                    src_slice[base_src] as f32 / 2147483648.0,
-                                    src_slice[base_src + 1] as f32 / 2147483648.0,
-                                ),
-                            };
-                            stereo_staging[frame * 2] = l;
-                            stereo_staging[frame * 2 + 1] = r;
-                        }
+                        let (l, r) = match channels {
+                            1 => {
+                                let s = get_sample(base_src);
+                                (s, s)
+                            }
+                            _ => (get_sample(base_src), get_sample(base_src + 3)),
+                        };
+                        stereo_staging[frame * 2] = l;
+                        stereo_staging[frame * 2 + 1] = r;
                     }
-                    EndpointSampleFormat::Pcm24Packed => {
-                        let src_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                buffer_ptr,
-                                (num_frames_read as usize) * channels * 3,
-                            )
+                }
+                EndpointSampleFormat::Pcm16 => {
+                    let src_slice = unsafe {
+                        std::slice::from_raw_parts(
+                            buffer_ptr as *const i16,
+                            (num_frames_read as usize) * channels,
+                        )
+                    };
+                    for frame in 0..(num_frames_read as usize) {
+                        let base_src = frame * channels;
+                        let (l, r) = match channels {
+                            1 => (
+                                src_slice[base_src] as f32 / 32768.0,
+                                src_slice[base_src] as f32 / 32768.0,
+                            ),
+                            _ => (
+                                src_slice[base_src] as f32 / 32768.0,
+                                src_slice[base_src + 1] as f32 / 32768.0,
+                            ),
                         };
-                        for frame in 0..(num_frames_read as usize) {
-                            let base_src = frame * channels * 3;
-                            let get_sample = |ch_offset: usize| -> f32 {
-                                let b0 = src_bytes[ch_offset] as i32;
-                                let b1 = src_bytes[ch_offset + 1] as i32;
-                                let b2 = src_bytes[ch_offset + 2] as i8 as i32;
-                                let val = (b2 << 16) | (b1 << 8) | b0;
-                                val as f32 / 8388608.0
-                            };
-                            let (l, r) = match channels {
-                                1 => {
-                                    let s = get_sample(base_src);
-                                    (s, s)
-                                }
-                                _ => (get_sample(base_src), get_sample(base_src + 3)),
-                            };
-                            stereo_staging[frame * 2] = l;
-                            stereo_staging[frame * 2 + 1] = r;
-                        }
-                    }
-                    EndpointSampleFormat::Pcm16 => {
-                        let src_slice = unsafe {
-                            std::slice::from_raw_parts(
-                                buffer_ptr as *const i16,
-                                (num_frames_read as usize) * channels,
-                            )
-                        };
-                        for frame in 0..(num_frames_read as usize) {
-                            let base_src = frame * channels;
-                            let (l, r) = match channels {
-                                1 => (
-                                    src_slice[base_src] as f32 / 32768.0,
-                                    src_slice[base_src] as f32 / 32768.0,
-                                ),
-                                _ => (
-                                    src_slice[base_src] as f32 / 32768.0,
-                                    src_slice[base_src + 1] as f32 / 32768.0,
-                                ),
-                            };
-                            stereo_staging[frame * 2] = l;
-                            stereo_staging[frame * 2 + 1] = r;
-                        }
+                        stereo_staging[frame * 2] = l;
+                        stereo_staging[frame * 2 + 1] = r;
                     }
                 }
             }
@@ -484,6 +496,7 @@ fn render_worker_loop(
     drift_atomic: &Arc<AtomicI32>,
     underrun_atomic: &Arc<AtomicU64>,
     slew_atomic: &Arc<AtomicU64>,
+    state_atomic: &Arc<AtomicU8>,
     stop_signal: &Arc<AtomicBool>,
 ) -> windows::core::Result<()> {
     let enumerator: IMMDeviceEnumerator =
@@ -671,6 +684,7 @@ fn render_worker_loop(
         }
 
         let _ = unsafe { render_client.ReleaseBuffer(frames_needed, 0) };
+        state_atomic.store(dsp.state() as u8, Ordering::Release);
     }
 
     let _ = unsafe { audio_client.Stop() };
@@ -735,7 +749,7 @@ mod tests {
         let cx = devices.iter().find(|d| d.name.contains("CX31993"));
 
         if let (Some(r), Some(c)) = (realtek, cx) {
-            println!("Testing 48kHz -> 384kHz Bridge: [{}] -> [{}]", &r.name, &c.name);
+            println!("Testing 48kHz -> 384kHz Bridge: [{}] -> [{}]", r.name, c.name);
             let mut bridge = DualOutputBridge::start(0, r.id.clone(), c.id.clone()).expect("Failed to start bridge");
             std::thread::sleep(Duration::from_millis(600));
             let lat = f32::from_bits(bridge.latency_ms.load(Ordering::Acquire));
@@ -865,9 +879,10 @@ mod tests {
                 let drift = bridge1.drift_ppm.load(Ordering::Acquire);
                 let underruns = bridge1.underrun_count.load(Ordering::Acquire);
                 let slews = bridge1.slew_trigger_count.load(Ordering::Acquire);
+                let fsm_state = bridge1.get_dsp_state();
                 println!(
-                    "Bridge CX31993->Realtek [sample {}]: latency = {:.2} ms, drift = {} ppm, underruns = {}, slews = {}",
-                    i, lat, drift, underruns, slews
+                    "Bridge CX31993->Realtek [sample {}]: fsm_state = {:?}, rb_fill_ms = {:.2} ms, underruns = {}, drift_ppm = {} ppm, slews = {}",
+                    i, fsm_state, lat, underruns, drift, slews
                 );
                 // Assert initial latency is stable around 40ms (<= 55ms, down radically from 119ms)
                 assert!(
@@ -894,9 +909,10 @@ mod tests {
                 let drift = bridge2.drift_ppm.load(Ordering::Acquire);
                 let underruns = bridge2.underrun_count.load(Ordering::Acquire);
                 let slews = bridge2.slew_trigger_count.load(Ordering::Acquire);
+                let fsm_state = bridge2.get_dsp_state();
                 println!(
-                    "Bridge Realtek->CX31993 [sample {}]: latency = {:.2} ms, drift = {} ppm, underruns = {}, slews = {}",
-                    i, lat, drift, underruns, slews
+                    "Bridge Realtek->CX31993 [sample {}]: fsm_state = {:?}, rb_fill_ms = {:.2} ms, underruns = {}, drift_ppm = {} ppm, slews = {}",
+                    i, fsm_state, lat, underruns, drift, slews
                 );
                 assert!(
                     lat <= 55.0,

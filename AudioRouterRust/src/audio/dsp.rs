@@ -15,10 +15,58 @@
 
 use crate::audio::ring_buffer::SpscRingBuffer;
 
+/// Discrete State Machine states for the Resampler engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ResamplerState {
+    /// Initial state waiting for input buffer priming.
+    Priming = 0,
+    /// Actively rendering audio with fractional Hermite interpolation and clock tracking.
+    Running = 1,
+    /// Graceful 3ms Cosine fade-out into silence upon ring buffer starvation.
+    UnderrunFadeOut = 2,
+    /// Holding silence and frozen PI integrator while ring buffer replenishes to hysteresis threshold.
+    Repriming = 3,
+}
+
+impl ResamplerState {
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            0 => Self::Priming,
+            1 => Self::Running,
+            2 => Self::UnderrunFadeOut,
+            _ => Self::Repriming,
+        }
+    }
+}
+
+/// Dynamic configuration parameters for `AdaptiveResamplerDsp`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResamplerConfig {
+    pub capture_rate: u32,
+    pub render_rate: u32,
+    pub target_fill_ms: f32,    // default: 30.0
+    pub reprime_fill_ms: f32,   // default: 25.0
+    pub fade_ms: f32,           // default: 3.0
+}
+
+impl Default for ResamplerConfig {
+    fn default() -> Self {
+        Self {
+            capture_rate: 48000,
+            render_rate: 48000,
+            target_fill_ms: 30.0,
+            reprime_fill_ms: 25.0,
+            fade_ms: 3.0,
+        }
+    }
+}
+
 /// Adaptive Resampler and DSP processing engine for a single audio endpoint.
 pub struct AdaptiveResamplerDsp {
     history: [[f32; 2]; 4],
-    history_primed: bool,
+    state: ResamplerState,
+    config: ResamplerConfig,
     frac_pos: f64,
     integral_error: f64,
     smoothed_drift: f64,
@@ -26,6 +74,7 @@ pub struct AdaptiveResamplerDsp {
     current_gain: f32,
     base_ratio: f64,
     target_fill_frames: usize,
+    reprime_fill_frames: usize,
     last_drift_ppm: i32,
     in_rate: u32,
     out_rate: u32,
@@ -35,6 +84,10 @@ pub struct AdaptiveResamplerDsp {
     slew_total: usize,
     slew_from_l: f32,
     slew_from_r: f32,
+    fade_counter: usize,
+    fade_total: usize,
+    fade_from_l: f32,
+    fade_from_r: f32,
     default_slew_frames: usize,
     micro_slew_frames: usize,
     had_underrun: bool,
@@ -61,23 +114,47 @@ impl AdaptiveResamplerDsp {
     pub fn new(in_rate: u32, out_rate: u32, target_latency_ms: u32) -> Self {
         let safe_in_rate = if in_rate == 0 { 48000 } else { in_rate };
         let safe_out_rate = if out_rate == 0 { 48000 } else { out_rate };
+        let target_ms = if target_latency_ms == 0 { 30.0 } else { target_latency_ms as f32 };
+        let reprime_ms = if target_ms >= 30.0 {
+            25.0
+        } else {
+            (target_ms * 0.25).max(2.0)
+        };
+        let config = ResamplerConfig {
+            capture_rate: safe_in_rate,
+            render_rate: safe_out_rate,
+            target_fill_ms: target_ms,
+            reprime_fill_ms: reprime_ms,
+            fade_ms: 3.0,
+        };
+        Self::with_config(config)
+    }
+
+    /// Creates a new DSP engine with explicit `ResamplerConfig`.
+    pub fn with_config(config: ResamplerConfig) -> Self {
+        let safe_in_rate = if config.capture_rate == 0 { 48000 } else { config.capture_rate };
+        let safe_out_rate = if config.render_rate == 0 { 48000 } else { config.render_rate };
         let target_fill_frames =
-            ((safe_in_rate as usize) * (target_latency_ms as usize)) / 1000;
+            ((safe_in_rate as f32 * config.target_fill_ms / 1000.0) as usize).max(64);
+        let reprime_fill_frames =
+            ((safe_in_rate as f32 * config.reprime_fill_ms / 1000.0) as usize).max(16);
         // Time-scaled 10ms default slew frames: 480 @ 48kHz, 3,840 @ 384kHz
         let default_slew_frames = ((safe_out_rate as usize) / 100).max(256);
-        // Time-scaled 3ms micro-slew frames for underrun recovery: 144 @ 48kHz, 1,152 @ 384kHz
-        let micro_slew_frames = ((safe_out_rate as usize) * 3 / 1000).max(16);
+        // Time-scaled 3ms micro-slew frames for underrun recovery / fade-in / fade-out: 144 @ 48kHz, 1,152 @ 384kHz
+        let micro_slew_frames = ((safe_out_rate as f32 * config.fade_ms / 1000.0).round() as usize).max(16);
 
         Self {
             history: [[0.0; 2]; 4],
-            history_primed: false,
+            state: ResamplerState::Priming,
+            config,
             frac_pos: 0.0,
             integral_error: 0.0,
             smoothed_drift: 1.0,
             current_drift_ppm: 0.0,
             current_gain: 1.0,
             base_ratio: (safe_in_rate as f64) / (safe_out_rate as f64),
-            target_fill_frames: target_fill_frames.max(128),
+            target_fill_frames,
+            reprime_fill_frames,
             last_drift_ppm: 0,
             in_rate: safe_in_rate,
             out_rate: safe_out_rate,
@@ -87,12 +164,40 @@ impl AdaptiveResamplerDsp {
             slew_total: default_slew_frames,
             slew_from_l: 0.0,
             slew_from_r: 0.0,
+            fade_counter: 0,
+            fade_total: micro_slew_frames,
+            fade_from_l: 0.0,
+            fade_from_r: 0.0,
             default_slew_frames,
             micro_slew_frames,
             had_underrun: false,
             underrun_count: 0,
             slew_trigger_count: 0,
         }
+    }
+
+    /// Current FSM state of the resampler engine.
+    #[inline(always)]
+    pub fn state(&self) -> ResamplerState {
+        self.state
+    }
+
+    /// Resampler configuration parameters.
+    #[inline(always)]
+    pub fn config(&self) -> &ResamplerConfig {
+        &self.config
+    }
+
+    /// Reprime fill threshold in frames.
+    #[inline(always)]
+    pub fn reprime_fill_frames(&self) -> usize {
+        self.reprime_fill_frames
+    }
+
+    /// Updates the reprime threshold in milliseconds.
+    pub fn set_reprime_fill_ms(&mut self, ms: f32) {
+        self.config.reprime_fill_ms = ms;
+        self.reprime_fill_frames = ((self.in_rate as f32 * ms / 1000.0) as usize).max(16);
     }
 
     /// Capture sample rate in Hz.
@@ -137,10 +242,10 @@ impl AdaptiveResamplerDsp {
         &self.history
     }
 
-    /// Reset DSP internal state (history, phase, integrator, gain, slew).
+    /// Reset DSP internal state (history, FSM state, phase, integrator, gain, slew).
     pub fn reset(&mut self) {
         self.history = [[0.0; 2]; 4];
-        self.history_primed = false;
+        self.state = ResamplerState::Priming;
         self.frac_pos = 0.0;
         self.integral_error = 0.0;
         self.smoothed_drift = 1.0;
@@ -152,9 +257,53 @@ impl AdaptiveResamplerDsp {
         self.slew_total = self.micro_slew_frames;
         self.slew_from_l = 0.0;
         self.slew_from_r = 0.0;
+        self.fade_counter = 0;
+        self.fade_total = self.micro_slew_frames;
+        self.fade_from_l = 0.0;
+        self.fade_from_r = 0.0;
         self.had_underrun = false;
         self.underrun_count = 0;
         self.slew_trigger_count = 0;
+    }
+
+    /// Primes the 4-frame history buffer [f0, f0, f1, f2] from the ring buffer.
+    ///
+    /// Consumes exactly 3 frames (or available 1..2 frames in starved boundary edge-cases).
+    /// Preserves 100% of f0 at t = 0.0 and aligns read cursor 1:1 with consumed frames.
+    fn prime_history_from_rb(&mut self, rb: &SpscRingBuffer, read_cursor: &mut usize, avail_frames: usize) {
+        let unread = avail_frames.saturating_sub(*read_cursor);
+        if unread >= 3 {
+            let f0 = rb.peek_frame_stereo(*read_cursor);
+            let f1 = rb.peek_frame_stereo(*read_cursor + 1);
+            let f2 = rb.peek_frame_stereo(*read_cursor + 2);
+            self.history = [
+                [f0.0, f0.1],
+                [f0.0, f0.1],
+                [f1.0, f1.1],
+                [f2.0, f2.1],
+            ];
+            *read_cursor += 3;
+        } else if unread == 2 {
+            let f0 = rb.peek_frame_stereo(*read_cursor);
+            let f1 = rb.peek_frame_stereo(*read_cursor + 1);
+            self.history = [
+                [f0.0, f0.1],
+                [f1.0, f1.1],
+                [f1.0, f1.1],
+                [f1.0, f1.1],
+            ];
+            *read_cursor += 2;
+        } else if unread == 1 {
+            let f0 = rb.peek_frame_stereo(*read_cursor);
+            self.history = [
+                [f0.0, f0.1],
+                [f0.0, f0.1],
+                [f0.0, f0.1],
+                [f0.0, f0.1],
+            ];
+            *read_cursor += 1;
+        }
+        self.frac_pos = 0.0;
     }
 
     /// Total number of buffer underruns encountered.
@@ -285,249 +434,209 @@ impl AdaptiveResamplerDsp {
             avail_frames = self.target_fill_frames;
         }
 
-        // Underrun protection: if the buffer is completely empty,
-        // apply smooth exponential slew-to-zero (decay factor 0.999) from the last sample
-        // to maintain derivative and amplitude continuity without clicks.
-        if avail_frames == 0 {
-            if !self.had_underrun {
-                self.underrun_count += 1;
-            }
-            self.had_underrun = true;
-            for frame_idx in 0..out_frames {
-                self.last_sample_l *= 0.999;
-                self.last_sample_r *= 0.999;
-                if self.last_sample_l.abs() < 1e-7 {
-                    self.last_sample_l = 0.0;
-                }
-                if self.last_sample_r.abs() < 1e-7 {
-                    self.last_sample_r = 0.0;
-                }
-                let out_l = self.last_sample_l;
-                let out_r = self.last_sample_r;
+        let mut read_cursor = 0usize;
 
-                let base_idx = frame_idx * channels;
-                match channels {
-                    1 => out_interleaved[base_idx] = 0.5 * (out_l + out_r),
-                    2 => {
-                        out_interleaved[base_idx] = out_l;
-                        out_interleaved[base_idx + 1] = out_r;
+        // FSM State transitions before block processing
+        match self.state {
+            ResamplerState::Priming => {
+                if avail_frames > 0 {
+                    self.prime_history_from_rb(rb, &mut read_cursor, avail_frames);
+                    self.state = ResamplerState::Running;
+                } else {
+                    if !self.had_underrun {
+                        self.underrun_count += 1;
                     }
-                    _ => {
-                        out_interleaved[base_idx] = out_l;
-                        out_interleaved[base_idx + 1] = out_r;
-                        for ch in 2..channels {
-                            out_interleaved[base_idx + ch] = 0.0;
-                        }
-                    }
+                    self.had_underrun = true;
+                    self.state = ResamplerState::Repriming;
                 }
             }
-            return;
-        }
-
-        // If recovering from a previous starvation/underrun, slew smoothly into incoming audio
-        // using 3ms Micro-Crossfade from last_sample that was written to hardware
-        if self.had_underrun {
-            self.had_underrun = false;
-            self.slew_from_l = self.last_sample_l;
-            self.slew_from_r = self.last_sample_r;
-            self.slew_total = self.micro_slew_frames;
-            self.slew_counter = self.slew_total;
-            self.slew_trigger_count += 1;
+            ResamplerState::Repriming => {
+                if avail_frames >= self.reprime_fill_frames {
+                    self.prime_history_from_rb(rb, &mut read_cursor, avail_frames);
+                    self.state = ResamplerState::Running;
+                    self.had_underrun = false;
+                    self.slew_from_l = 0.0;
+                    self.slew_from_r = 0.0;
+                    self.slew_total = self.micro_slew_frames;
+                    self.slew_counter = self.slew_total;
+                    self.slew_trigger_count += 1;
+                }
+            }
+            ResamplerState::Running => {
+                if avail_frames == 0 {
+                    self.state = ResamplerState::UnderrunFadeOut;
+                    if !self.had_underrun {
+                        self.underrun_count += 1;
+                    }
+                    self.had_underrun = true;
+                    self.fade_from_l = self.last_sample_l;
+                    self.fade_from_r = self.last_sample_r;
+                    self.fade_total = self.micro_slew_frames;
+                    self.fade_counter = self.fade_total;
+                }
+            }
+            ResamplerState::UnderrunFadeOut => {}
         }
 
         // 3-Zone Continuous Rate Controller (Bounded PI + Soft Recovery + Slew-Rate Limiter)
-        let target = self.target_fill_frames as f64;
-        let current = avail_frames as f64;
-        let fill_ratio = current / target;
+        // ONLY active when in Running state. Frozen during Priming, Repriming, or UnderrunFadeOut.
+        if self.state == ResamplerState::Running {
+            let target = self.target_fill_frames as f64;
+            let current = avail_frames as f64;
+            let fill_ratio = current / target;
 
-        let target_drift_ppm = if fill_ratio > 1.3 {
-            // Zone 2: Soft Proportional Drain (1.3 < fill_ratio <= 2.5)
-            // Gently increases reading speed smoothly from +500.0 up to +1500.0 ppm using Smoothstep (3x^2 - 2x^3).
-            let excess_norm = ((fill_ratio - 1.3) / 1.2).clamp(0.0, 1.0);
-            let smooth_curve = excess_norm * excess_norm * (3.0 - 2.0 * excess_norm);
-            self.integral_error = 0.0; // Reset/freeze PI integral to avoid windup while draining burst
-            500.0 + smooth_curve * 1000.0
-        } else if fill_ratio < 0.7 {
-            // Zone 2: Soft Deficit Recovery (fill_ratio < 0.7)
-            // Gently slows reading speed smoothly from -500.0 down to -1500.0 ppm using Smoothstep.
-            let deficit_norm = ((0.7 - fill_ratio) / 0.7).clamp(0.0, 1.0);
-            let smooth_curve = deficit_norm * deficit_norm * (3.0 - 2.0 * deficit_norm);
+            let target_drift_ppm = if fill_ratio > 1.3 {
+                // Zone 2: Soft Proportional Drain (1.3 < fill_ratio <= 2.5)
+                // Gently increases reading speed smoothly from +500.0 up to +1500.0 ppm using Smoothstep (3x^2 - 2x^3).
+                let excess_norm = ((fill_ratio - 1.3) / 1.2).clamp(0.0, 1.0);
+                let smooth_curve = excess_norm * excess_norm * (3.0 - 2.0 * excess_norm);
+                self.integral_error = 0.0; // Reset/freeze PI integral to avoid windup while draining burst
+                500.0 + smooth_curve * 1000.0
+            } else if fill_ratio < 0.7 {
+                // Zone 2: Soft Deficit Recovery (fill_ratio < 0.7)
+                // Gently slows reading speed smoothly from -500.0 down to -1500.0 ppm using Smoothstep.
+                let deficit_norm = ((0.7 - fill_ratio) / 0.7).clamp(0.0, 1.0);
+                let smooth_curve = deficit_norm * deficit_norm * (3.0 - 2.0 * deficit_norm);
+                self.integral_error = 0.0;
+                -500.0 - smooth_curve * 1000.0
+            } else {
+                // Zone 1: Normal Clock Tracking (0.7 <= fill_ratio <= 1.3)
+                // Precise PI controller with hard bounds [-500.0, +500.0] ppm
+                let error = (current - target) / target;
+                let kp = 1000.0; // in ppm
+                let ki = 5.0;    // in ppm
+                self.integral_error = (self.integral_error + error).clamp(-40.0, 40.0);
+                (kp * error + ki * self.integral_error).clamp(-500.0, 500.0)
+            };
+
+            // Slew-Rate Limiter: Maximum drift rate change is 50.0 ppm/s
+            let dt = (out_frames as f64) / (self.out_rate as f64);
+            let max_delta_ppm = 50.0 * dt;
+            let delta = target_drift_ppm - self.current_drift_ppm;
+            let clamped_delta = delta.clamp(-max_delta_ppm, max_delta_ppm);
+            self.current_drift_ppm += clamped_delta;
+            self.current_drift_ppm = self.current_drift_ppm.clamp(-1500.0, 1500.0);
+
+            self.smoothed_drift = 1.0 + (self.current_drift_ppm / 1_000_000.0);
+            self.last_drift_ppm = if self.current_drift_ppm > 0.0 && self.current_drift_ppm < 1.0 {
+                1
+            } else if self.current_drift_ppm < 0.0 && self.current_drift_ppm > -1.0 {
+                -1
+            } else {
+                self.current_drift_ppm.round() as i32
+            };
+        } else {
+            // Freeze PI drift controller when not in Running state (anti-windup)
             self.integral_error = 0.0;
-            -500.0 - smooth_curve * 1000.0
-        } else {
-            // Zone 1: Normal Clock Tracking (0.7 <= fill_ratio <= 1.3)
-            // Precise PI controller with hard bounds [-500.0, +500.0] ppm
-            let error = (current - target) / target;
-            let kp = 1000.0; // in ppm
-            let ki = 5.0;    // in ppm
-            self.integral_error = (self.integral_error + error).clamp(-40.0, 40.0);
-            (kp * error + ki * self.integral_error).clamp(-500.0, 500.0)
-        };
-
-        // Slew-Rate Limiter: Maximum drift rate change is 50.0 ppm/s
-        let dt = (out_frames as f64) / (self.out_rate as f64);
-        let max_delta_ppm = 50.0 * dt;
-        let delta = target_drift_ppm - self.current_drift_ppm;
-        let clamped_delta = delta.clamp(-max_delta_ppm, max_delta_ppm);
-        self.current_drift_ppm += clamped_delta;
-        self.current_drift_ppm = self.current_drift_ppm.clamp(-1500.0, 1500.0);
-
-        self.smoothed_drift = 1.0 + (self.current_drift_ppm / 1_000_000.0);
-        self.last_drift_ppm = if self.current_drift_ppm > 0.0 && self.current_drift_ppm < 1.0 {
-            1
-        } else if self.current_drift_ppm < 0.0 && self.current_drift_ppm > -1.0 {
-            -1
-        } else {
-            self.current_drift_ppm.round() as i32
-        };
+        }
 
         let step = self.base_ratio * self.smoothed_drift;
         let effective_target_gain = if muted { 0.0 } else { target_linear_gain };
         let smooth_alpha = 0.002f32; // ~10ms convergence at 48kHz (Zero-zipper noise)
 
-        let mut read_cursor = 0usize;
-
-        // If history is not yet primed (at startup, after reset, or after starvation),
-        // prime the 4-frame history from the ring buffer.
-        if !self.history_primed {
-            if avail_frames == 1 {
-                let f0 = rb.peek_frame_stereo(0);
-                self.history = [[f0.0, f0.1]; 4];
-                read_cursor = 1;
-                self.history_primed = true;
-                self.frac_pos = 0.0;
-            } else if avail_frames == 2 {
-                let f0 = rb.peek_frame_stereo(0);
-                let f1 = rb.peek_frame_stereo(1);
-                self.history = [
-                    [f0.0, f0.1],
-                    [f1.0, f1.1],
-                    [f1.0, f1.1],
-                    [f1.0, f1.1],
-                ];
-                read_cursor = 2;
-                self.history_primed = true;
-                self.frac_pos = 0.0;
-            } else if avail_frames == 3 {
-                let f0 = rb.peek_frame_stereo(0);
-                let f1 = rb.peek_frame_stereo(1);
-                let f2 = rb.peek_frame_stereo(2);
-                self.history = [
-                    [f0.0, f0.1],
-                    [f1.0, f1.1],
-                    [f2.0, f2.1],
-                    [f2.0, f2.1],
-                ];
-                read_cursor = 3;
-                self.history_primed = true;
-                self.frac_pos = 0.0;
-            } else if avail_frames >= 4 {
-                let f0 = rb.peek_frame_stereo(0);
-                let f1 = rb.peek_frame_stereo(1);
-                let f2 = rb.peek_frame_stereo(2);
-                let f3 = rb.peek_frame_stereo(3);
-                self.history = [
-                    [f0.0, f0.1],
-                    [f1.0, f1.1],
-                    [f2.0, f2.1],
-                    [f3.0, f3.1],
-                ];
-                read_cursor = 4;
-                self.history_primed = true;
-                self.frac_pos = 0.0;
-            }
-        }
-
         for frame_idx in 0..out_frames {
             // One-pole exponential gain smoother (De-zipper)
             self.current_gain += smooth_alpha * (effective_target_gain - self.current_gain);
 
-            let (out_l, out_r) = if self.had_underrun {
-                // Buffer depleted during block processing:
-                // Smooth exponential slew-to-zero (decay factor 0.999) from last valid sample
-                self.last_sample_l *= 0.999;
-                self.last_sample_r *= 0.999;
-                if self.last_sample_l.abs() < 1e-7 {
-                    self.last_sample_l = 0.0;
+            let (out_l, out_r) = match self.state {
+                ResamplerState::Priming | ResamplerState::Repriming => {
+                    (0.0f32, 0.0f32)
                 }
-                if self.last_sample_r.abs() < 1e-7 {
-                    self.last_sample_r = 0.0;
-                }
-                (self.last_sample_l, self.last_sample_r)
-            } else {
-                // Unity-Ratio 1:1 optimization branch:
-                // When in_rate == out_rate, |drift_ppm| < 5.0 (deadband), and frac_pos < 1e-6:
-                // Output history[1] directly (preserving exact 1-sample group delay as Hermite).
-                let is_unity_ratio = self.in_rate == self.out_rate
-                    && self.last_drift_ppm.abs() < 5
-                    && self.frac_pos < 1e-6;
-
-                let (sample_l, sample_r) = if is_unity_ratio {
-                    (self.history[1][0], self.history[1][1])
-                } else {
-                    let t = self.frac_pos as f32;
-                    let sl = Self::cubic_hermite(
-                        self.history[0][0],
-                        self.history[1][0],
-                        self.history[2][0],
-                        self.history[3][0],
-                        t,
-                    );
-                    let sr = Self::cubic_hermite(
-                        self.history[0][1],
-                        self.history[1][1],
-                        self.history[2][1],
-                        self.history[3][1],
-                        t,
-                    );
-                    (sl, sr)
-                };
-
-                let gained_l = sample_l * self.current_gain;
-                let gained_r = sample_r * self.current_gain;
-
-                // Time-Scaled Cosine Crossfade Slew (Hann window):
-                let (slewed_l, slewed_r) = if self.slew_counter > 0 && self.slew_total > 0 {
-                    let progress = 1.0 - (self.slew_counter as f32 / self.slew_total as f32);
-                    let alpha = 0.5 * (1.0 - (progress * std::f32::consts::PI).cos());
-                    let l = (1.0 - alpha) * self.slew_from_l + alpha * gained_l;
-                    let r = (1.0 - alpha) * self.slew_from_r + alpha * gained_r;
-                    self.slew_counter -= 1;
-                    (l, r)
-                } else {
-                    (gained_l, gained_r)
-                };
-
-                // Soft Limiting / Headroom Guard:
-                let sl = Self::soft_limit(slewed_l);
-                let sr = Self::soft_limit(slewed_r);
-
-                // Advance phase and history window
-                let effective_step = if is_unity_ratio { 1.0 } else { step };
-                self.frac_pos += effective_step;
-
-                if self.frac_pos >= 1.0 {
-                    let advance = self.frac_pos.floor() as usize;
-                    self.frac_pos -= advance as f64;
-                    if self.frac_pos < 0.0 {
-                        self.frac_pos = 0.0;
-                    }
-                    if is_unity_ratio && self.frac_pos < 1e-6 {
-                        self.frac_pos = 0.0;
-                    }
-
-                    // Check if ring buffer has more frames if needed
-                    if read_cursor + advance > avail_frames {
-                        let cur_avail = rb.available_read() / 2;
-                        if cur_avail > avail_frames {
-                            avail_frames = cur_avail;
+                ResamplerState::UnderrunFadeOut => {
+                    if self.fade_total > 0 && self.fade_counter > 0 {
+                        let progress = (self.fade_total - self.fade_counter) as f32 / self.fade_total as f32;
+                        let alpha = 0.5 * (1.0 + (progress * std::f32::consts::PI).cos());
+                        let l = self.fade_from_l * alpha;
+                        let r = self.fade_from_r * alpha;
+                        self.fade_counter -= 1;
+                        if self.fade_counter == 0 {
+                            self.state = ResamplerState::Repriming;
+                            self.last_sample_l = 0.0;
+                            self.last_sample_r = 0.0;
+                            self.integral_error = 0.0;
                         }
+                        (l, r)
+                    } else {
+                        self.state = ResamplerState::Repriming;
+                        self.last_sample_l = 0.0;
+                        self.last_sample_r = 0.0;
+                        self.integral_error = 0.0;
+                        (0.0f32, 0.0f32)
                     }
+                }
+                ResamplerState::Running => {
+                    // Unity-Ratio 1:1 optimization branch:
+                    // When in_rate == out_rate, |drift_ppm| < 5.0 (deadband), and frac_pos < 1e-6:
+                    // Output history[1] directly (preserving exact 1-sample group delay as Hermite).
+                    let is_unity_ratio = self.in_rate == self.out_rate
+                        && self.last_drift_ppm.abs() < 5
+                        && self.frac_pos < 1e-6;
 
-                    let avail_to_read = avail_frames.saturating_sub(read_cursor);
-                    if avail_to_read >= advance {
-                        match advance {
-                            1 => {
+                    let (sample_l, sample_r) = if is_unity_ratio {
+                        (self.history[1][0], self.history[1][1])
+                    } else {
+                        let t = self.frac_pos as f32;
+                        let sl = Self::cubic_hermite(
+                            self.history[0][0],
+                            self.history[1][0],
+                            self.history[2][0],
+                            self.history[3][0],
+                            t,
+                        );
+                        let sr = Self::cubic_hermite(
+                            self.history[0][1],
+                            self.history[1][1],
+                            self.history[2][1],
+                            self.history[3][1],
+                            t,
+                        );
+                        (sl, sr)
+                    };
+
+                    let gained_l = sample_l * self.current_gain;
+                    let gained_r = sample_r * self.current_gain;
+
+                    // Time-Scaled Cosine Crossfade Slew (Hann window):
+                    let (slewed_l, slewed_r) = if self.slew_counter > 0 && self.slew_total > 0 {
+                        let progress = 1.0 - (self.slew_counter as f32 / self.slew_total as f32);
+                        let alpha = 0.5 * (1.0 - (progress * std::f32::consts::PI).cos());
+                        let l = (1.0 - alpha) * self.slew_from_l + alpha * gained_l;
+                        let r = (1.0 - alpha) * self.slew_from_r + alpha * gained_r;
+                        self.slew_counter -= 1;
+                        (l, r)
+                    } else {
+                        (gained_l, gained_r)
+                    };
+
+                    // Soft Limiting / Headroom Guard:
+                    let sl = Self::soft_limit(slewed_l);
+                    let sr = Self::soft_limit(slewed_r);
+
+                    // Advance phase and history window
+                    let effective_step = if is_unity_ratio { 1.0 } else { step };
+                    self.frac_pos += effective_step;
+
+                    if self.frac_pos >= 1.0 {
+                        let advance = self.frac_pos.floor() as usize;
+                        self.frac_pos -= advance as f64;
+                        if self.frac_pos < 0.0 {
+                            self.frac_pos = 0.0;
+                        }
+                        if is_unity_ratio && self.frac_pos < 1e-6 {
+                            self.frac_pos = 0.0;
+                        }
+
+                        // Check if ring buffer has more frames if needed
+                        if read_cursor + advance > avail_frames {
+                            let cur_avail = rb.available_read() / 2;
+                            if cur_avail > avail_frames {
+                                avail_frames = cur_avail;
+                            }
+                        }
+
+                        let avail_to_read = avail_frames.saturating_sub(read_cursor);
+                        if avail_to_read >= advance {
+                            for _ in 0..advance {
                                 self.history[0] = self.history[1];
                                 self.history[1] = self.history[2];
                                 self.history[2] = self.history[3];
@@ -535,63 +644,30 @@ impl AdaptiveResamplerDsp {
                                 self.history[3] = [f.0, f.1];
                                 read_cursor += 1;
                             }
-                            2 => {
-                                self.history[0] = self.history[2];
-                                self.history[1] = self.history[3];
-                                let f0 = rb.peek_frame_stereo(read_cursor);
-                                let f1 = rb.peek_frame_stereo(read_cursor + 1);
-                                self.history[2] = [f0.0, f0.1];
-                                self.history[3] = [f1.0, f1.1];
-                                read_cursor += 2;
+                        } else {
+                            // Starvation / underrun: shift remaining available frames then transition
+                            for _ in 0..avail_to_read {
+                                self.history[0] = self.history[1];
+                                self.history[1] = self.history[2];
+                                self.history[2] = self.history[3];
+                                let f = rb.peek_frame_stereo(read_cursor);
+                                self.history[3] = [f.0, f.1];
+                                read_cursor += 1;
                             }
-                            3 => {
-                                self.history[0] = self.history[3];
-                                let f0 = rb.peek_frame_stereo(read_cursor);
-                                let f1 = rb.peek_frame_stereo(read_cursor + 1);
-                                let f2 = rb.peek_frame_stereo(read_cursor + 2);
-                                self.history[1] = [f0.0, f0.1];
-                                self.history[2] = [f1.0, f1.1];
-                                self.history[3] = [f2.0, f2.1];
-                                read_cursor += 3;
+                            self.state = ResamplerState::UnderrunFadeOut;
+                            if !self.had_underrun {
+                                self.underrun_count += 1;
                             }
-                            _ => {
-                                read_cursor += advance - 4;
-                                let f0 = rb.peek_frame_stereo(read_cursor);
-                                let f1 = rb.peek_frame_stereo(read_cursor + 1);
-                                let f2 = rb.peek_frame_stereo(read_cursor + 2);
-                                let f3 = rb.peek_frame_stereo(read_cursor + 3);
-                                self.history[0] = [f0.0, f0.1];
-                                self.history[1] = [f1.0, f1.1];
-                                self.history[2] = [f2.0, f2.1];
-                                self.history[3] = [f3.0, f3.1];
-                                read_cursor += 4;
-                            }
-                        }
-                    } else if avail_to_read > 0 {
-                        for _ in 0..avail_to_read {
-                            self.history[0] = self.history[1];
-                            self.history[1] = self.history[2];
-                            self.history[2] = self.history[3];
-                            let f = rb.peek_frame_stereo(read_cursor);
-                            self.history[3] = [f.0, f.1];
-                            read_cursor += 1;
-                        }
-                        if !self.had_underrun {
                             self.had_underrun = true;
-                            self.underrun_count += 1;
+                            self.fade_from_l = sl;
+                            self.fade_from_r = sr;
+                            self.fade_total = self.micro_slew_frames;
+                            self.fade_counter = self.fade_total;
                         }
-                        self.history_primed = false;
-                    } else {
-                        // avail_to_read == 0: Ring Buffer is completely depleted!
-                        if !self.had_underrun {
-                            self.had_underrun = true;
-                            self.underrun_count += 1;
-                        }
-                        self.history_primed = false;
                     }
-                }
 
-                (sl, sr)
+                    (sl, sr)
+                }
             };
 
             self.last_sample_l = out_l;
@@ -638,72 +714,90 @@ impl AdaptiveResamplerDsp {
     {
         let mut frames_consumed = 0usize;
 
-        if !self.history_primed {
-            let mut temp_frames = [[0.0f32; 2]; 4];
-            let mut primed_count = 0;
-            while primed_count < 4 {
-                if let Some(f) = pop_frame() {
-                    temp_frames[primed_count] = f;
-                    primed_count += 1;
-                    frames_consumed += 1;
+        match self.state {
+            ResamplerState::Priming => {
+                let mut temp = [[0.0f32; 2]; 3];
+                let mut count = 0;
+                while count < 3 {
+                    if let Some(f) = pop_frame() {
+                        temp[count] = f;
+                        count += 1;
+                        frames_consumed += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if count == 0 {
+                    if !self.had_underrun {
+                        self.had_underrun = true;
+                        self.underrun_count += 1;
+                    }
+                    self.state = ResamplerState::Repriming;
+                    for o in out.iter_mut() {
+                        *o = [0.0, 0.0];
+                    }
+                    return ProcessStats {
+                        frames_consumed: 0,
+                        had_underrun: true,
+                    };
+                }
+
+                match count {
+                    1 => self.history = [temp[0]; 4],
+                    2 => {
+                        self.history = [
+                            temp[0],
+                            temp[0],
+                            temp[1],
+                            temp[1],
+                        ]
+                    }
+                    _ => {
+                        self.history = [
+                            temp[0],
+                            temp[0],
+                            temp[1],
+                            temp[2],
+                        ]
+                    }
+                }
+                self.frac_pos = 0.0;
+                self.state = ResamplerState::Running;
+            }
+            ResamplerState::Repriming => {
+                let mut temp = [[0.0f32; 2]; 3];
+                let mut count = 0;
+                while count < 3 {
+                    if let Some(f) = pop_frame() {
+                        temp[count] = f;
+                        count += 1;
+                        frames_consumed += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if count >= 3 {
+                    self.history = [temp[0], temp[0], temp[1], temp[2]];
+                    self.frac_pos = 0.0;
+                    self.state = ResamplerState::Running;
+                    self.had_underrun = false;
+                    self.slew_from_l = 0.0;
+                    self.slew_from_r = 0.0;
+                    self.slew_total = self.micro_slew_frames;
+                    self.slew_counter = self.slew_total;
+                    self.slew_trigger_count += 1;
                 } else {
-                    break;
-                }
-            }
-
-            if primed_count == 0 {
-                if !self.had_underrun {
-                    self.had_underrun = true;
-                    self.underrun_count += 1;
-                }
-                for o in out.iter_mut() {
-                    self.last_sample_l *= 0.999;
-                    self.last_sample_r *= 0.999;
-                    if self.last_sample_l.abs() < 1e-7 {
-                        self.last_sample_l = 0.0;
+                    for o in out.iter_mut() {
+                        *o = [0.0, 0.0];
                     }
-                    if self.last_sample_r.abs() < 1e-7 {
-                        self.last_sample_r = 0.0;
-                    }
-                    *o = [self.last_sample_l, self.last_sample_r];
+                    return ProcessStats {
+                        frames_consumed,
+                        had_underrun: true,
+                    };
                 }
-                return ProcessStats {
-                    frames_consumed: 0,
-                    had_underrun: true,
-                };
             }
-
-            match primed_count {
-                1 => self.history = [temp_frames[0]; 4],
-                2 => {
-                    self.history = [
-                        temp_frames[0],
-                        temp_frames[1],
-                        temp_frames[1],
-                        temp_frames[1],
-                    ]
-                }
-                3 => {
-                    self.history = [
-                        temp_frames[0],
-                        temp_frames[1],
-                        temp_frames[2],
-                        temp_frames[2],
-                    ]
-                }
-                _ => self.history = temp_frames,
-            }
-            self.history_primed = true;
-            self.frac_pos = 0.0;
-        }
-
-        if self.had_underrun {
-            self.had_underrun = false;
-            self.slew_from_l = self.last_sample_l;
-            self.slew_from_r = self.last_sample_r;
-            self.slew_total = self.micro_slew_frames;
-            self.slew_counter = self.slew_total;
-            self.slew_trigger_count += 1;
+            ResamplerState::Running | ResamplerState::UnderrunFadeOut => {}
         }
 
         let is_unity_ratio = self.in_rate == self.out_rate
@@ -713,82 +807,97 @@ impl AdaptiveResamplerDsp {
         let effective_step = if is_unity_ratio { 1.0 } else { step };
 
         for out_frame in out.iter_mut() {
-            let (out_l, out_r) = if self.had_underrun {
-                self.last_sample_l *= 0.999;
-                self.last_sample_r *= 0.999;
-                if self.last_sample_l.abs() < 1e-7 {
-                    self.last_sample_l = 0.0;
-                }
-                if self.last_sample_r.abs() < 1e-7 {
-                    self.last_sample_r = 0.0;
-                }
-                (self.last_sample_l, self.last_sample_r)
-            } else {
-                let (sample_l, sample_r) = if is_unity_ratio && self.frac_pos < 1e-6 {
-                    (self.history[1][0], self.history[1][1])
-                } else {
-                    let t = self.frac_pos as f32;
-                    let sl = Self::cubic_hermite(
-                        self.history[0][0],
-                        self.history[1][0],
-                        self.history[2][0],
-                        self.history[3][0],
-                        t,
-                    );
-                    let sr = Self::cubic_hermite(
-                        self.history[0][1],
-                        self.history[1][1],
-                        self.history[2][1],
-                        self.history[3][1],
-                        t,
-                    );
-                    (sl, sr)
-                };
-
-                let (slewed_l, slewed_r) = if self.slew_counter > 0 && self.slew_total > 0 {
-                    let progress = 1.0 - (self.slew_counter as f32 / self.slew_total as f32);
-                    let alpha = 0.5 * (1.0 - (progress * std::f32::consts::PI).cos());
-                    let l = (1.0 - alpha) * self.slew_from_l + alpha * sample_l;
-                    let r = (1.0 - alpha) * self.slew_from_r + alpha * sample_r;
-                    self.slew_counter -= 1;
-                    (l, r)
-                } else {
-                    (sample_l, sample_r)
-                };
-
-                let sl = Self::soft_limit(slewed_l);
-                let sr = Self::soft_limit(slewed_r);
-
-                self.frac_pos += effective_step;
-                if self.frac_pos >= 1.0 {
-                    let advance = self.frac_pos.floor() as usize;
-                    self.frac_pos -= advance as f64;
-                    if self.frac_pos < 0.0 {
-                        self.frac_pos = 0.0;
+            let (out_l, out_r) = match self.state {
+                ResamplerState::Priming | ResamplerState::Repriming => (0.0f32, 0.0f32),
+                ResamplerState::UnderrunFadeOut => {
+                    if self.fade_total > 0 && self.fade_counter > 0 {
+                        let progress = (self.fade_total - self.fade_counter) as f32 / self.fade_total as f32;
+                        let alpha = 0.5 * (1.0 + (progress * std::f32::consts::PI).cos());
+                        let l = self.fade_from_l * alpha;
+                        let r = self.fade_from_r * alpha;
+                        self.fade_counter -= 1;
+                        if self.fade_counter == 0 {
+                            self.state = ResamplerState::Repriming;
+                            self.last_sample_l = 0.0;
+                            self.last_sample_r = 0.0;
+                        }
+                        (l, r)
+                    } else {
+                        self.state = ResamplerState::Repriming;
+                        (0.0, 0.0)
                     }
-                    if is_unity_ratio && self.frac_pos < 1e-6 {
-                        self.frac_pos = 0.0;
-                    }
+                }
+                ResamplerState::Running => {
+                    let (sample_l, sample_r) = if is_unity_ratio && self.frac_pos < 1e-6 {
+                        (self.history[1][0], self.history[1][1])
+                    } else {
+                        let t = self.frac_pos as f32;
+                        let sl = Self::cubic_hermite(
+                            self.history[0][0],
+                            self.history[1][0],
+                            self.history[2][0],
+                            self.history[3][0],
+                            t,
+                        );
+                        let sr = Self::cubic_hermite(
+                            self.history[0][1],
+                            self.history[1][1],
+                            self.history[2][1],
+                            self.history[3][1],
+                            t,
+                        );
+                        (sl, sr)
+                    };
 
-                    for _ in 0..advance {
-                        if let Some(f) = pop_frame() {
-                            self.history[0] = self.history[1];
-                            self.history[1] = self.history[2];
-                            self.history[2] = self.history[3];
-                            self.history[3] = f;
-                            frames_consumed += 1;
-                        } else {
-                            if !self.had_underrun {
-                                self.had_underrun = true;
-                                self.underrun_count += 1;
+                    let (slewed_l, slewed_r) = if self.slew_counter > 0 && self.slew_total > 0 {
+                        let progress = 1.0 - (self.slew_counter as f32 / self.slew_total as f32);
+                        let alpha = 0.5 * (1.0 - (progress * std::f32::consts::PI).cos());
+                        let l = (1.0 - alpha) * self.slew_from_l + alpha * sample_l;
+                        let r = (1.0 - alpha) * self.slew_from_r + alpha * sample_r;
+                        self.slew_counter -= 1;
+                        (l, r)
+                    } else {
+                        (sample_l, sample_r)
+                    };
+
+                    let sl = Self::soft_limit(slewed_l);
+                    let sr = Self::soft_limit(slewed_r);
+
+                    self.frac_pos += effective_step;
+                    if self.frac_pos >= 1.0 {
+                        let advance = self.frac_pos.floor() as usize;
+                        self.frac_pos -= advance as f64;
+                        if self.frac_pos < 0.0 {
+                            self.frac_pos = 0.0;
+                        }
+                        if is_unity_ratio && self.frac_pos < 1e-6 {
+                            self.frac_pos = 0.0;
+                        }
+
+                        for _ in 0..advance {
+                            if let Some(f) = pop_frame() {
+                                self.history[0] = self.history[1];
+                                self.history[1] = self.history[2];
+                                self.history[2] = self.history[3];
+                                self.history[3] = f;
+                                frames_consumed += 1;
+                            } else {
+                                self.state = ResamplerState::UnderrunFadeOut;
+                                if !self.had_underrun {
+                                    self.had_underrun = true;
+                                    self.underrun_count += 1;
+                                }
+                                self.fade_from_l = sl;
+                                self.fade_from_r = sr;
+                                self.fade_total = self.micro_slew_frames;
+                                self.fade_counter = self.fade_total;
+                                break;
                             }
-                            self.history_primed = false;
-                            break;
                         }
                     }
-                }
 
-                (sl, sr)
+                    (sl, sr)
+                }
             };
 
             self.last_sample_l = out_l;
@@ -1379,5 +1488,169 @@ mod tests {
 
         assert!(stats.frames_consumed >= 4, "Should have primed at least 4 frames");
         assert!(!stats.had_underrun);
+    }
+
+    #[test]
+    fn test_fsm_state_transitions_and_f0_preservation() {
+        let config = ResamplerConfig {
+            capture_rate: 48000,
+            render_rate: 48000,
+            target_fill_ms: 30.0,
+            reprime_fill_ms: 25.0,
+            fade_ms: 3.0,
+        };
+        let mut dsp = AdaptiveResamplerDsp::with_config(config);
+        let rb = SpscRingBuffer::new(4096);
+
+        // 1. Initial state is Priming
+        assert_eq!(dsp.state(), ResamplerState::Priming);
+        assert_eq!(dsp.underrun_count(), 0);
+
+        // 2. Push 100 frames with distinct stepped amplitudes
+        let mut input = Vec::with_capacity(200);
+        for f in 0..100 {
+            let l = 0.35 + (f as f32) * 0.005;
+            let r = -0.25 - (f as f32) * 0.005;
+            input.push(l);
+            input.push(r);
+        }
+        rb.push_slice(&input);
+
+        // 3. Process 10 frames
+        let mut out = vec![0.0f32; 10 * 2];
+        dsp.process_output_block(&rb, &mut out, 1.0, false);
+
+        // Must be in Running state now
+        assert_eq!(dsp.state(), ResamplerState::Running);
+        assert_eq!(dsp.underrun_count(), 0);
+
+        // CRITICAL INVARIANT: f0 is preserved 100% at sample 0 (scaled by soft_limit 0.982)
+        let expected_f0_l = 0.35 * 0.982;
+        let expected_f0_r = -0.25 * 0.982;
+        assert!(
+            (out[0] - expected_f0_l).abs() < 1e-5,
+            "f0 (Left) was not preserved! expected={:.6}, got={:.6}",
+            expected_f0_l,
+            out[0]
+        );
+        assert!(
+            (out[1] - expected_f0_r).abs() < 1e-5,
+            "f0 (Right) was not preserved! expected={:.6}, got={:.6}",
+            expected_f0_r,
+            out[1]
+        );
+
+        // Verify exact consumed frames: primed 3 + 10 output frames = 13 frames consumed
+        let remaining = rb.available_read() / 2;
+        assert_eq!(remaining, 87, "Exactly 13 frames should be consumed (3 primed + 10 advanced)");
+    }
+
+    #[test]
+    fn test_fsm_underrun_fadeout_and_repriming_hysteresis() {
+        let config = ResamplerConfig {
+            capture_rate: 48000,
+            render_rate: 48000,
+            target_fill_ms: 30.0,
+            reprime_fill_ms: 25.0, // 25ms @ 48kHz = 1200 frames
+            fade_ms: 3.0,          // 3ms @ 48kHz = 144 frames
+        };
+        let mut dsp = AdaptiveResamplerDsp::with_config(config);
+        let rb = SpscRingBuffer::new(16384);
+
+        // 1. Prime and run with 1500 frames (> target 1440)
+        let audio = vec![0.5f32; 1500 * 2];
+        rb.push_slice(&audio);
+
+        let mut block = vec![0.0f32; 480 * 2]; // 10ms block
+        dsp.process_output_block(&rb, &mut block, 1.0, false);
+        assert_eq!(dsp.state(), ResamplerState::Running);
+        assert_eq!(dsp.underrun_count(), 0);
+
+        // 2. Drain ring buffer completely to trigger starvation
+        // Remaining in RB is ~1500 - 483 = 1017 frames.
+        // Process 2 more 10ms blocks (960 frames):
+        dsp.process_output_block(&rb, &mut block, 1.0, false); // consumes 480 -> remaining ~537
+        dsp.process_output_block(&rb, &mut block, 1.0, false); // consumes 480 -> remaining ~57
+        assert_eq!(dsp.state(), ResamplerState::Running);
+
+        // Next block needs 480 frames but RB only has ~57 frames:
+        dsp.process_output_block(&rb, &mut block, 1.0, false);
+        // During this block, buffer depleted -> UnderrunFadeOut triggered (144 frames fade) -> Repriming!
+        assert_eq!(dsp.underrun_count(), 1);
+        assert_eq!(dsp.state(), ResamplerState::Repriming);
+
+        // 3. PI Integrator freeze check: when in Repriming, integral error is reset/frozen
+        assert_eq!(dsp.integral_error, 0.0);
+
+        // 4. In Repriming state: output MUST be absolute silence (0.0)
+        dsp.process_output_block(&rb, &mut block, 1.0, false);
+        for &s in &block {
+            assert_eq!(s, 0.0, "Repriming state must output strict silence");
+        }
+        assert_eq!(dsp.state(), ResamplerState::Repriming);
+
+        // 5. HYSTERESIS CHECK: Push 10ms (480 frames) < reprime threshold (1200 frames = 25ms)
+        let partial_audio = vec![0.6f32; 480 * 2];
+        rb.push_slice(&partial_audio);
+
+        dsp.process_output_block(&rb, &mut block, 1.0, false);
+        // Must STAY in Repriming! Zero chopper effect! Output remains 0.0
+        assert_eq!(dsp.state(), ResamplerState::Repriming);
+        for &s in &block {
+            assert_eq!(s, 0.0, "Hysteresis must withhold playback until reprime threshold reached");
+        }
+
+        // 6. Push remaining audio to cross 25ms reprime threshold (need >= 1200 frames)
+        let more_audio = vec![0.6f32; 800 * 2]; // 480 + 800 = 1280 frames >= 1200
+        rb.push_slice(&more_audio);
+
+        let initial_slews = dsp.slew_trigger_count();
+        dsp.process_output_block(&rb, &mut block, 1.0, false);
+
+        // Must transition Repriming -> Running with 3ms Cosine Fade-In
+        assert_eq!(dsp.state(), ResamplerState::Running);
+        assert_eq!(dsp.slew_trigger_count(), initial_slews + 1, "Must trigger Fade-In slew");
+        // Verify audio returned smoothly (first samples ramping up from 0.0)
+        assert!(block[0] >= 0.0);
+        assert!(block[block.len() - 1] > block[0], "Fade-In must ramp audio amplitude up");
+    }
+
+    #[test]
+    fn test_underrun_fadeout_smoothness_no_clicks() {
+        let config = ResamplerConfig {
+            capture_rate: 48000,
+            render_rate: 48000,
+            target_fill_ms: 30.0,
+            reprime_fill_ms: 25.0,
+            fade_ms: 3.0,
+        };
+        let mut dsp = AdaptiveResamplerDsp::with_config(config);
+        let rb = SpscRingBuffer::new(2048);
+
+        // Feed only 50 frames of loud 0.8 amplitude audio
+        let input = vec![0.8f32; 50 * 2];
+        rb.push_slice(&input);
+
+        // Request 250 frames (500 samples): buffer starves after 50 frames
+        let mut out = vec![0.0f32; 250 * 2];
+        dsp.process_output_block(&rb, &mut out, 1.0, false);
+
+        assert_eq!(dsp.underrun_count(), 1);
+
+        // Check continuity across entire starvation fade-out: NO CLIFF / POP (|diff| < 0.025)
+        let mut max_diff = 0.0f32;
+        for i in 2..out.len() {
+            let diff = (out[i] - out[i - 2]).abs(); // compare same channel
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 0.025,
+                "Starvation click/pop detected at sample {}: diff={:.6}",
+                i,
+                diff
+            );
+        }
+        // Tail must reach complete silence (0.0)
+        assert_eq!(out[out.len() - 1], 0.0);
+        assert_eq!(out[out.len() - 2], 0.0);
     }
 }

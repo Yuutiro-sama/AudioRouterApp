@@ -20,7 +20,7 @@ pub use capture::{
     AudioClientProcessLoopbackParams, ProcessLoopbackMode,
     VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
 };
-pub use dsp::AdaptiveResamplerDsp;
+pub use dsp::{AdaptiveResamplerDsp, ResamplerConfig, ResamplerState};
 pub use enumerator::{
     enumerate_capture_devices, enumerate_render_devices, get_active_app_sessions,
     get_default_render_device, get_device_endpoint_volume, get_pids_by_process_name,
@@ -41,7 +41,8 @@ pub use policy_config::{
 };
 pub use render::{
     detect_sample_format, spawn_render_worker, write_frames_to_wasapi, EndpointSampleFormat,
-    RenderTargetState, TpdfDitherState, XorShift32, PCM24_MAX, PCM24_MIN, PCM24_SCALE,
+    RenderTargetState, TpdfDitherState, XorShift32, KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE, PCM24_MAX,
+    PCM24_MIN, PCM24_SCALE,
 };
 pub use ring_buffer::SpscRingBuffer;
 

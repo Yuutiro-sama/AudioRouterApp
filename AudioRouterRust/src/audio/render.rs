@@ -49,6 +49,12 @@ pub const PCM16_MIN: i32 = -32_768;
 pub const PCM16_MAX: i32 = 32_767;
 pub const PCM16_SCALE: f64 = 32_767.0;
 
+/// Keep-alive dither floor at -96 dBFS (~1.58489e-5).
+/// Injected during silence (|sample| < 1e-6 or 0.0) to prevent aggressive hardware DAC
+/// auto-mute / power-gating (e.g. CX31993 at 384kHz) from shutting down analog stages
+/// during speech pauses, eliminating DC switching pop when speech resumes.
+pub const KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE: f64 = 1.58489e-5;
+
 /// Supported audio sample encoding on WASAPI output endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointSampleFormat {
@@ -90,13 +96,13 @@ pub unsafe fn detect_sample_format(pwfx: *const WAVEFORMATEX) -> EndpointSampleF
     // WAVE_FORMAT_EXTENSIBLE = 0xFFFE
     if wfx.wFormatTag == 0xFFFE && wfx.cbSize >= 22 {
         let wfxe = &*(pwfx as *const WAVEFORMATEXTENSIBLE);
-        let subformat = std::ptr::addr_of!((*wfxe).SubFormat).read_unaligned();
+        let subformat = std::ptr::addr_of!(wfxe.SubFormat).read_unaligned();
         // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT GUID: 00000003-0000-0010-8000-00AA00389B71
         if subformat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT || subformat.data1 == 0x00000003 {
             return EndpointSampleFormat::Float32;
         }
 
-        let valid_bits = std::ptr::addr_of!((*wfxe).Samples.wValidBitsPerSample).read_unaligned();
+        let valid_bits = std::ptr::addr_of!(wfxe.Samples.wValidBitsPerSample).read_unaligned();
         if bits == 32 && (valid_bits == 24 || valid_bits == 32 || valid_bits == 0) {
             return EndpointSampleFormat::Pcm32Container24;
         }
@@ -219,9 +225,15 @@ impl TpdfDitherState {
 
 /// Transfers and converts f32 samples [-1.0, 1.0] to native WASAPI DMA buffer format.
 ///
+/// # Gain Staging Contract
+/// Volume and mute processing are unified in the DSP pipeline (`process_output_block_multichannel`).
+/// Therefore, callers passing DSP-processed buffers MUST pass `volume = 1.0f32` here to prevent
+/// exponential double attenuation (e.g., 0.6 * 0.6 = 0.36).
+///
 /// # Safety
 /// The caller must ensure that `dst_ptr` points to a writable buffer with at least
 /// `frames * channels * format.bytes_per_sample()` bytes of allocated memory.
+#[allow(clippy::needless_range_loop, clippy::manual_is_multiple_of)]
 pub unsafe fn write_frames_to_wasapi(
     dst_ptr: *mut u8,
     src_interleaved_f32: &[f32],
@@ -248,12 +260,17 @@ pub unsafe fn write_frames_to_wasapi(
             let out_slice = std::slice::from_raw_parts_mut(dst_ptr as *mut f32, total_dest_samples);
             if is_multichannel_src {
                 for i in 0..total_dest_samples {
+                    let ch = i % channels;
                     let sample = src_interleaved_f32[i];
-                    out_slice[i] = if sample.is_finite() {
+                    let mut s = if sample.is_finite() {
                         (sample * volume).clamp(-1.0, 1.0)
                     } else {
                         0.0
                     };
+                    if s.abs() < 1e-6 {
+                        s += (dither_state.next_channel_tpdf_lsb(ch) * KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE) as f32;
+                    }
+                    out_slice[i] = s;
                 }
             } else {
                 for i in 0..frames {
@@ -278,9 +295,17 @@ pub unsafe fn write_frames_to_wasapi(
                             if sr.is_finite() { (sr * volume).clamp(-1.0, 1.0) } else { 0.0 },
                         )
                     };
-                    out_slice[i * channels] = l;
+                    let mut out_l = l;
+                    if out_l.abs() < 1e-6 {
+                        out_l += (dither_state.next_channel_tpdf_lsb(0) * KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE) as f32;
+                    }
+                    out_slice[i * channels] = out_l;
                     if channels > 1 {
-                        out_slice[i * channels + 1] = r;
+                        let mut out_r = r;
+                        if out_r.abs() < 1e-6 {
+                            out_r += (dither_state.next_channel_tpdf_lsb(1) * KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE) as f32;
+                        }
+                        out_slice[i * channels + 1] = out_r;
                     }
                     for ch in 2..channels {
                         out_slice[i * channels + ch] = 0.0;
@@ -294,11 +319,14 @@ pub unsafe fn write_frames_to_wasapi(
                 for i in 0..total_dest_samples {
                     let ch = i % channels;
                     let sample = src_interleaved_f32[i];
-                    let s = if sample.is_finite() {
+                    let mut s = if sample.is_finite() {
                         ((sample * volume) as f64).clamp(-1.0, 1.0)
                     } else {
                         0.0
                     };
+                    if s.abs() < 1e-6 {
+                        s += dither_state.next_channel_tpdf_lsb(ch) * KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE;
+                    }
                     let dither = dither_state.next_channel_tpdf_lsb(ch);
                     let q24 = ((s * PCM24_SCALE + dither).round() as i64)
                         .clamp(PCM24_MIN as i64, PCM24_MAX as i64) as i32;
@@ -327,14 +355,22 @@ pub unsafe fn write_frames_to_wasapi(
                             if sr.is_finite() { (sr * volume).clamp(-1.0, 1.0) } else { 0.0 },
                         )
                     };
+                    let mut sl = l as f64;
+                    if sl.abs() < 1e-6 {
+                        sl += dither_state.next_channel_tpdf_lsb(0) * KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE;
+                    }
                     let dither_l = dither_state.next_channel_tpdf_lsb(0);
-                    let q24_l = (((l as f64) * PCM24_SCALE + dither_l).round() as i64)
+                    let q24_l = (((sl) * PCM24_SCALE + dither_l).round() as i64)
                         .clamp(PCM24_MIN as i64, PCM24_MAX as i64) as i32;
                     out_slice[i * channels] = q24_l << 8;
 
                     if channels > 1 {
+                        let mut sr = r as f64;
+                        if sr.abs() < 1e-6 {
+                            sr += dither_state.next_channel_tpdf_lsb(1) * KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE;
+                        }
                         let dither_r = dither_state.next_channel_tpdf_lsb(1);
-                        let q24_r = (((r as f64) * PCM24_SCALE + dither_r).round() as i64)
+                        let q24_r = (((sr) * PCM24_SCALE + dither_r).round() as i64)
                             .clamp(PCM24_MIN as i64, PCM24_MAX as i64) as i32;
                         out_slice[i * channels + 1] = q24_r << 8;
                     }
@@ -350,11 +386,14 @@ pub unsafe fn write_frames_to_wasapi(
                 for i in 0..total_dest_samples {
                     let ch = i % channels;
                     let sample = src_interleaved_f32[i];
-                    let s = if sample.is_finite() {
+                    let mut s = if sample.is_finite() {
                         ((sample * volume) as f64).clamp(-1.0, 1.0)
                     } else {
                         0.0
                     };
+                    if s.abs() < 1e-6 {
+                        s += dither_state.next_channel_tpdf_lsb(ch) * KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE;
+                    }
                     let dither = dither_state.next_channel_tpdf_lsb(ch);
                     let q24 = ((s * PCM24_SCALE + dither).round() as i64)
                         .clamp(PCM24_MIN as i64, PCM24_MAX as i64) as i32;
@@ -390,7 +429,10 @@ pub unsafe fn write_frames_to_wasapi(
                     for ch in 0..channels {
                         let offset = (i * channels + ch) * 3;
                         if ch < 2 {
-                            let s = samples[ch] as f64;
+                            let mut s = samples[ch] as f64;
+                            if s.abs() < 1e-6 {
+                                s += dither_state.next_channel_tpdf_lsb(ch) * KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE;
+                            }
                             let dither = dither_state.next_channel_tpdf_lsb(ch);
                             let q24 = ((s * PCM24_SCALE + dither).round() as i64)
                                 .clamp(PCM24_MIN as i64, PCM24_MAX as i64) as i32;
@@ -411,13 +453,18 @@ pub unsafe fn write_frames_to_wasapi(
             let out_slice = std::slice::from_raw_parts_mut(dst_ptr as *mut i16, total_dest_samples);
             if is_multichannel_src {
                 for i in 0..total_dest_samples {
+                    let ch = i % channels;
                     let sample = src_interleaved_f32[i];
-                    let s = if sample.is_finite() {
+                    let mut s = if sample.is_finite() {
                         ((sample * volume) as f64).clamp(-1.0, 1.0)
                     } else {
                         0.0
                     };
-                    let q16 = ((s * PCM16_SCALE).round() as i64)
+                    if s.abs() < 1e-6 {
+                        s += dither_state.next_channel_tpdf_lsb(ch) * KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE;
+                    }
+                    let dither = dither_state.next_channel_tpdf_lsb(ch);
+                    let q16 = ((s * PCM16_SCALE + dither).round() as i64)
                         .clamp(PCM16_MIN as i64, PCM16_MAX as i64) as i16;
                     out_slice[i] = q16;
                 }
@@ -444,11 +491,21 @@ pub unsafe fn write_frames_to_wasapi(
                             if sr.is_finite() { (sr * volume).clamp(-1.0, 1.0) } else { 0.0 },
                         )
                     };
-                    let q16_l = (((l as f64) * PCM16_SCALE).round() as i64)
+                    let mut sl = l as f64;
+                    if sl.abs() < 1e-6 {
+                        sl += dither_state.next_channel_tpdf_lsb(0) * KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE;
+                    }
+                    let dither_l = dither_state.next_channel_tpdf_lsb(0);
+                    let q16_l = (((sl) * PCM16_SCALE + dither_l).round() as i64)
                         .clamp(PCM16_MIN as i64, PCM16_MAX as i64) as i16;
                     out_slice[i * channels] = q16_l;
                     if channels > 1 {
-                        let q16_r = (((r as f64) * PCM16_SCALE).round() as i64)
+                        let mut sr = r as f64;
+                        if sr.abs() < 1e-6 {
+                            sr += dither_state.next_channel_tpdf_lsb(1) * KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE;
+                        }
+                        let dither_r = dither_state.next_channel_tpdf_lsb(1);
+                        let q16_r = (((sr) * PCM16_SCALE + dither_r).round() as i64)
                             .clamp(PCM16_MIN as i64, PCM16_MAX as i64) as i16;
                         out_slice[i * channels + 1] = q16_r;
                     }
@@ -1211,5 +1268,59 @@ mod tests {
         assert_eq!(dst_pcm16[0], 16384); // 0.5 * 32767.0 rounded
         assert_eq!(dst_pcm16[2], 32767); // clamped 1.2 -> 1.0 -> 32767
         assert_eq!(dst_pcm16[3], -32767); // clamped -1.2 -> -1.0 -> -32767
+    }
+
+    #[test]
+    fn test_keep_alive_dither_floor_injection() {
+        let input_silence = vec![0.0f32; 100 * 2]; // 100 frames stereo silence
+        let channels = 2;
+
+        // 1. Deterministic zero dither -> strict 0.0 across all formats
+        let mut dither_zero = TpdfDitherState::deterministic_zero();
+        let mut dst_float_zero = vec![0.0f32; 100 * channels];
+        unsafe {
+            write_frames_to_wasapi(
+                dst_float_zero.as_mut_ptr() as *mut u8,
+                &input_silence,
+                channels,
+                EndpointSampleFormat::Float32,
+                1.0,
+                &mut dither_zero,
+            );
+        }
+        for &s in &dst_float_zero {
+            assert_eq!(s, 0.0);
+        }
+
+        // 2. Active dither -> Keep-Alive Dither Floor injected at -96 dBFS (~1.58e-5)
+        let mut dither_active = TpdfDitherState::new();
+        let mut dst_float_active = vec![0.0f32; 100 * channels];
+        unsafe {
+            write_frames_to_wasapi(
+                dst_float_active.as_mut_ptr() as *mut u8,
+                &input_silence,
+                channels,
+                EndpointSampleFormat::Float32,
+                1.0,
+                &mut dither_active,
+            );
+        }
+
+        let mut has_non_zero = false;
+        let mut max_abs = 0.0f32;
+        for &s in &dst_float_active {
+            if s.abs() > 0.0 {
+                has_non_zero = true;
+            }
+            max_abs = max_abs.max(s.abs());
+            // Must be bounded within +/- 2.0 * KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE
+            assert!(
+                s.abs() <= (KEEP_ALIVE_DITHER_FLOOR_AMPLITUDE as f32 * 2.0),
+                "Keep-alive floor exceeded limit: {}",
+                s
+            );
+        }
+        assert!(has_non_zero, "Keep-alive dither was not injected for silence input!");
+        assert!(max_abs > 0.0 && max_abs < 3.2e-5);
     }
 }

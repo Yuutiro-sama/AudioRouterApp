@@ -81,6 +81,35 @@ impl SpscRingBuffer {
         to_write
     }
 
+    /// Pushes `frames` stereo frames of silence (0.0f32) into the ring buffer
+    /// without heap allocation.
+    /// Returns the number of stereo frames actually written.
+    pub fn push_silence(&self, frames: usize) -> usize {
+        let samples_to_write = frames * 2;
+        let w = self.write_idx.0.load(Ordering::Relaxed);
+        let r = self.read_idx.0.load(Ordering::Acquire);
+        let free = self.capacity.saturating_sub(w.wrapping_sub(r));
+        // Align to stereo frame boundary (pairs of samples)
+        let to_write = (samples_to_write.min(free) / 2) * 2;
+
+        for i in 0..to_write {
+            unsafe {
+                *self.buffer[(w.wrapping_add(i)) & self.mask].get() = 0.0f32;
+            }
+        }
+        self.write_idx.0.store(w.wrapping_add(to_write), Ordering::Release);
+        to_write / 2
+    }
+
+    /// Calculates available audio duration in milliseconds for the given sample rate.
+    #[inline(always)]
+    pub fn available_ms(&self, rate: u32) -> f32 {
+        if rate == 0 {
+            return 0.0;
+        }
+        (self.available_read() / 2) as f32 * 1000.0 / rate as f32
+    }
+
     /// Peeks a stereo frame (Left, Right) at `frame_offset` from current read position
     /// without advancing the read index. Ideal for 4-point cubic Hermite interpolation.
     #[inline(always)]
@@ -201,5 +230,42 @@ mod tests {
         // Pushing more should write 0 samples
         let written2 = rb.push_slice(&data);
         assert_eq!(written2, 0);
+    }
+
+    #[test]
+    fn test_ring_buffer_push_silence_and_available_ms() {
+        let rb = SpscRingBuffer::new(64);
+        assert_eq!(rb.available_read(), 0);
+        assert_eq!(rb.available_ms(48000), 0.0);
+
+        // Push 10 frames of silence = 20 samples
+        let frames_written = rb.push_silence(10);
+        assert_eq!(frames_written, 10);
+        assert_eq!(rb.available_read(), 20);
+
+        // Check available_ms at 48000Hz: (20 / 2) * 1000.0 / 48000 = 10 * 1000 / 48000 = 0.208333... ms
+        let ms = rb.available_ms(48000);
+        assert!((ms - 0.20833333).abs() < 1e-4);
+
+        // Check peek returns 0.0 for all samples
+        for i in 0..10 {
+            let (l, r) = rb.peek_frame_stereo(i);
+            assert_eq!(l, 0.0f32);
+            assert_eq!(r, 0.0f32);
+        }
+
+        // Advance 5 frames
+        rb.advance_read_frames(5);
+        assert_eq!(rb.available_read(), 10);
+        assert_eq!(rb.available_write(), 54);
+
+        // Now buffer has 54 free samples (27 stereo frames). Try pushing 30 frames
+        let frames_written2 = rb.push_silence(30);
+        assert_eq!(frames_written2, 27); // Clamped to available space
+        assert_eq!(rb.available_read(), 64);
+        assert_eq!(rb.available_write(), 0);
+
+        // Further push_silence should write 0
+        assert_eq!(rb.push_silence(5), 0);
     }
 }

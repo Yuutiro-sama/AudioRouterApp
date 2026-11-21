@@ -368,16 +368,26 @@ fn loopback_capture_loop(
             }
 
             let is_silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
+            if is_silent {
+                if num_frames_read > 0 {
+                    if let Ok(guard) = targets.read() {
+                        for target in guard.iter() {
+                            if target.is_enabled() {
+                                target.ring_buffer.push_silence(num_frames_read as usize);
+                            }
+                        }
+                    }
+                }
+                let _ = unsafe { capture_client.ReleaseBuffer(num_frames_read) };
+                continue;
+            }
+
             let total_stereo_samples = (num_frames_read as usize) * 2;
             if stereo_staging.len() < total_stereo_samples {
                 stereo_staging.resize(total_stereo_samples, 0.0f32);
             }
 
-            if is_silent {
-                for sample in &mut stereo_staging[..total_stereo_samples] {
-                    *sample = 0.0;
-                }
-            } else if is_float && bits_per_sample == 32 {
+            if is_float && bits_per_sample == 32 {
                 let src_slice = unsafe {
                     std::slice::from_raw_parts(
                         buffer_ptr as *const f32,
